@@ -11,6 +11,10 @@
     "Svga": {
       "swift": "HybridSvga",
       "kotlin": "HybridSvga"
+    },
+    "SvgaManager": {
+      "swift": "HybridSvgaManager",
+      "kotlin": "HybridSvgaManager"
     }
   },
   "ignorePaths": ["node_modules"]

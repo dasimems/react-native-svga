@@ -1,10 +1,10 @@
 import { View, StyleSheet } from 'react-native';
-import { SvgaView } from 'react-native-svga';
+import { SvgaPlayer } from 'react-native-svga';
 
 export default function App() {
   return (
     <View style={styles.container}>
-      <SvgaView color="#32a852" style={styles.box} />
+      <SvgaPlayer source="https://assets.svga.io/svga/sample.svga" />
     </View>
   );
 }
