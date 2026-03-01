@@ -1,0 +1,17 @@
+{
+  "cxxNamespace": ["svga"],
+  "ios": {
+    "iosModuleName": "Svga"
+  },
+  "android": {
+    "androidNamespace": ["svga"],
+    "androidCxxLibName": "svga"
+  },
+  "autolinking": {
+    "Svga": {
+      "swift": "HybridSvga",
+      "kotlin": "HybridSvga"
+    }
+  },
+  "ignorePaths": ["node_modules"]
+}
