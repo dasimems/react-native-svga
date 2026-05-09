@@ -29,6 +29,15 @@ export interface SvgaPlayerProps {
   muteBuiltInAudio?: boolean;
   builtInAudioVolume?: number;
 
+  /**
+   * When false (default), playback (frames + audio) automatically stops when
+   * the player leaves the visible window or the app is backgrounded. Set to
+   * true if you want the audio to keep playing while the screen is offscreen
+   * or the app is backgrounded - similar to background playback in a video
+   * player.
+   */
+  playInBackground?: boolean;
+
   sounds?: SvgaSound[];
 
   scaleMode?: ScaleMode;

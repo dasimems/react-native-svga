@@ -17,6 +17,7 @@ internal object SvgaParser {
   private const val MAX_FRAMES = 100_000
   private const val MAX_SPRITES = 10_000
   private const val DEFAULT_FPS = 15
+  private const val MAX_BITMAP_DIMENSION = 2048
 
   fun parse(input: InputStream): SvgaEntity {
     val bytes = input.use { readAllBounded(it, MAX_BUNDLE_BYTES) }
@@ -57,6 +58,23 @@ internal object SvgaParser {
       wire == ProtoReader.WIRE_FIXED32
   }
 
+  private fun composeTransforms(movie: MovieEntity, bitmaps: Map<String, android.graphics.Bitmap>) {
+    for (sprite in movie.sprites) {
+      val bitmap = bitmaps[sprite.imageKey] ?: continue
+      val bw = bitmap.width.toFloat()
+      val bh = bitmap.height.toFloat()
+      if (bw <= 0f || bh <= 0f) continue
+      for (frame in sprite.frames) {
+        if (!frame.hasContent) continue
+        val w = frame.layout.width()
+        val h = frame.layout.height()
+        if (w <= 0f || h <= 0f) continue
+        frame.transform.preTranslate(frame.layout.left, frame.layout.top)
+        frame.transform.preScale(w / bw, h / bh)
+      }
+    }
+  }
+
   private fun parseZip(bytes: ByteArray): SvgaEntity {
     var movieBinary: ByteArray? = null
     val imageBytes = LinkedHashMap<String, ByteArray>()
@@ -93,6 +111,7 @@ internal object SvgaParser {
       if (imageBytes[key] == null && audioBytes[key] == null) imageBytes[key] = blob
     }
     val bitmaps = decodeBitmaps(imageBytes)
+    composeTransforms(parsed.movie, bitmaps)
     return SvgaEntity(parsed.movie, bitmaps, audioBytes)
   }
 
@@ -100,6 +119,7 @@ internal object SvgaParser {
     val parsed = parseMovie(bytes)
     val (imageBytes, audioBytes) = classifyBlobs(parsed)
     val bitmaps = decodeBitmaps(imageBytes)
+    composeTransforms(parsed.movie, bitmaps)
     return SvgaEntity(parsed.movie, bitmaps, audioBytes)
   }
 
@@ -158,13 +178,29 @@ internal object SvgaParser {
   }
 
   private fun decodeBitmaps(source: Map<String, ByteArray>): Map<String, android.graphics.Bitmap> {
-    val opts = BitmapFactory.Options().apply { inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888 }
     val out = HashMap<String, android.graphics.Bitmap>(source.size)
     for ((key, blob) in source) {
-      val bmp = BitmapFactory.decodeByteArray(blob, 0, blob.size, opts) ?: continue
+      val bmp = decodeBitmap(blob) ?: continue
       out[key] = bmp
     }
     return out
+  }
+
+  private fun decodeBitmap(blob: ByteArray): android.graphics.Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(blob, 0, blob.size, bounds)
+    val w = bounds.outWidth
+    val h = bounds.outHeight
+    if (w <= 0 || h <= 0) return null
+
+    var sampleSize = 1
+    while (maxOf(w, h) / sampleSize > MAX_BITMAP_DIMENSION) sampleSize *= 2
+
+    val opts = BitmapFactory.Options().apply {
+      inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+      inSampleSize = sampleSize
+    }
+    return BitmapFactory.decodeByteArray(blob, 0, blob.size, opts)
   }
 
   private data class ParsedMovie(val movie: MovieEntity, val inlineBlobs: Map<String, ByteArray>)

@@ -326,6 +326,7 @@ const sources = [intro, body, outro];
 | `speed` | `number` | `1.0` | Playback speed multiplier (0.05 minimum) |
 | `muteBuiltInAudio` | `boolean` | auto | If omitted, becomes `true` when `sounds` is non-empty |
 | `builtInAudioVolume` | `number` | `1.0` | 0-1 |
+| `playInBackground` | `boolean` | `false` | If `false`, playback (frames + audio) auto-pauses when the player leaves the visible window or the app is backgrounded. Set to `true` for video-style background audio. |
 | `sounds` | `SvgaSound[]` | - | Extra MP3s to play alongside the animation |
 | `scaleMode` | `'fill' \| 'aspectFit' \| 'aspectFill'` | `'aspectFit'` | How the content fits the view |
 | `style` | `ViewStyle` | - | Standard RN view style |
@@ -384,6 +385,22 @@ interface SvgaPlayerHandle {
 - Path traversal (`..`) rejected at the validator and in zip entry names
 - Bundle and entry size caps in the parser
 - Atomic disk writes (tmp + rename) so a partial download can't corrupt the cache
+
+## Lifecycle and background playback
+
+By default, `<SvgaPlayer>` stops both its frame loop and any active audio whenever:
+
+- The component unmounts.
+- The native view leaves the visible window (e.g. you navigated away in a stack navigator on iOS / Android).
+- The app moves to the background (`AppState` transitions away from `'active'`).
+
+This is what you usually want for gift animations and one-shot effects: the user moves on, the audio stops with them. When the player comes back on screen the animation does **not** auto-resume; call `play()` on the ref or remount to restart.
+
+Set `playInBackground={true}` if you want video-player-style behaviour, where audio (and the underlying playback state) survive backgrounding and navigation:
+
+```tsx
+<SvgaPlayer source={url} playInBackground />
+```
 
 ## Troubleshooting
 

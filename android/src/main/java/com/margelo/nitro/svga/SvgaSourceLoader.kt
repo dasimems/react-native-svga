@@ -6,7 +6,11 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 import javax.net.ssl.HttpsURLConnection
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 internal object SvgaSourceLoader {
 
@@ -16,14 +20,34 @@ internal object SvgaSourceLoader {
 
   class SourceException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
-  fun loadEntity(ctx: Context, source: String): SvgaEntity {
-    val cached = SvgaMemoryCache.get(source)
-    if (cached != null) return cached
+  private val inFlightEntities = ConcurrentHashMap<String, CompletableDeferred<SvgaEntity>>()
 
+  suspend fun loadEntity(ctx: Context, source: String): SvgaEntity {
+    SvgaMemoryCache.get(source)?.let { return it }
+
+    val deferred = CompletableDeferred<SvgaEntity>()
+    val existing = inFlightEntities.putIfAbsent(source, deferred)
+    if (existing != null) {
+      deferred.cancel()
+      return existing.await()
+    }
+
+    try {
+      val parsed = withContext(Dispatchers.IO) { loadEntityBlocking(ctx, source) }
+      SvgaMemoryCache.put(source, parsed)
+      deferred.complete(parsed)
+      return parsed
+    } catch (e: Throwable) {
+      deferred.completeExceptionally(e)
+      throw e
+    } finally {
+      inFlightEntities.remove(source)
+    }
+  }
+
+  private fun loadEntityBlocking(ctx: Context, source: String): SvgaEntity {
     val stream = openStream(ctx, source)
-    val parsed = stream.use { SvgaParser.parse(it) }
-    SvgaMemoryCache.put(source, parsed)
-    return parsed
+    return stream.use { SvgaParser.parse(it) }
   }
 
   fun preloadRemote(ctx: Context, url: String): File {

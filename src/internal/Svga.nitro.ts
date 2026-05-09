@@ -14,6 +14,8 @@ export interface SvgaProps extends HybridViewProps {
   // Audio (baked-in)
   muteBuiltInAudio: boolean;
   builtInAudioVolume: number;
+  // Lifecycle
+  playInBackground: boolean;
   // Styling
   scaleMode: ScaleMode;
 

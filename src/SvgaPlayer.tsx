@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
 } from 'react';
+import { AppState, type AppStateStatus } from 'react-native';
 import { getHostComponent } from 'react-native-nitro-modules';
 import type { Svga, SvgaMethods, SvgaProps } from './internal/Svga.nitro';
 import {
@@ -34,6 +35,7 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
       speed = 1.0,
       muteBuiltInAudio,
       builtInAudioVolume = 1.0,
+      playInBackground = false,
       sounds,
       scaleMode = 'aspectFit',
       style,
@@ -74,6 +76,23 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
         unloadAllSounds(svgaManager, sounds);
       };
     }, [sounds, onError]);
+
+    useEffect(() => {
+      if (playInBackground) return undefined;
+      const onChange = (state: AppStateStatus) => {
+        if (state === 'active') return;
+        hybridRef.current?.pause();
+      };
+      const subscription = AppState.addEventListener('change', onChange);
+      return () => subscription.remove();
+    }, [playInBackground]);
+
+    useEffect(() => {
+      return () => {
+        hybridRef.current?.stop();
+        svgaManager.stopAllSounds();
+      };
+    }, []);
 
     const handleStart = useCallback(() => {
       playSoundsForTrigger(svgaManager, sounds, 'start');
@@ -118,6 +137,7 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
         speed={speed}
         muteBuiltInAudio={effectiveMute}
         builtInAudioVolume={builtInAudioVolume}
+        playInBackground={playInBackground}
         scaleMode={scaleMode}
         style={style}
         {...eventHandlers}

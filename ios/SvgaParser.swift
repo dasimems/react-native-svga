@@ -1,6 +1,7 @@
 import Compression
 import CoreGraphics
 import Foundation
+import ImageIO
 import UIKit
 
 internal enum SvgaParser {
@@ -9,6 +10,7 @@ internal enum SvgaParser {
     private static let MAX_SPRITES = 10_000
     private static let DEFAULT_FPS = 15
     private static let MAX_INFLATED_BYTES = 64 * 1024 * 1024
+    private static let MAX_BITMAP_DIMENSION = 2048
 
     // SVGA ships in several packagings, all decoded into the same SvgaEntity:
     //   - v2 zip:           PK\x03\x04 ... movie.binary plus images/ and audio/
@@ -48,6 +50,26 @@ internal enum SvgaParser {
         return wire == 0 || wire == 2 || wire == 5
     }
 
+    private static func composeTransforms(_ movie: MovieEntity, images: [String: CGImage]) {
+        for sprite in movie.sprites {
+            guard let image = images[sprite.imageKey] else { continue }
+            let bw = CGFloat(image.width)
+            let bh = CGFloat(image.height)
+            if bw <= 0 || bh <= 0 { continue }
+            for frame in sprite.frames {
+                if !frame.hasContent { continue }
+                let w = frame.layout.size.width
+                let h = frame.layout.size.height
+                if w <= 0 || h <= 0 { continue }
+                var t = frame.transform
+                t = CGAffineTransform(translationX: frame.layout.origin.x, y: frame.layout.origin.y)
+                    .concatenating(t)
+                t = CGAffineTransform(scaleX: w / bw, y: h / bh).concatenating(t)
+                frame.transform = t
+            }
+        }
+    }
+
     private static func parseZip(_ data: Data) throws -> SvgaEntity {
         let entries = try ZipReader.entries(from: data)
         var movieBinary: Data?
@@ -78,6 +100,7 @@ internal enum SvgaParser {
         }
 
         let images = decodeImages(imageBytes)
+        composeTransforms(parsed.movie, images: images)
         return SvgaEntity(movie: parsed.movie, images: images, audioData: audioBytes)
     }
 
@@ -85,6 +108,7 @@ internal enum SvgaParser {
         let parsed = try parseMovie(data)
         let (imageBytes, audioBytes) = classifyBlobs(parsed)
         let images = decodeImages(imageBytes)
+        composeTransforms(parsed.movie, images: images)
         return SvgaEntity(movie: parsed.movie, images: images, audioData: audioBytes)
     }
 
@@ -111,10 +135,21 @@ internal enum SvgaParser {
         var out: [String: CGImage] = [:]
         out.reserveCapacity(source.count)
         for (key, data) in source {
-            guard let image = UIImage(data: data)?.cgImage else { continue }
+            guard let image = decodeImage(data) else { continue }
             out[key] = image
         }
         return out
+    }
+
+    private static func decodeImage(_ data: Data) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: MAX_BITMAP_DIMENSION,
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 
     private struct ParsedMovie {

@@ -7,6 +7,7 @@ internal final class SvgaPlayerView: UIView {
     typealias FrameHandler = (Int, Bool) -> Void
     typealias LoopHandler = (Int) -> Void
     typealias FinishHandler = () -> Void
+    typealias WindowVisibilityHandler = (Bool) -> Void
 
     var entity: SvgaEntity? {
         didSet {
@@ -22,6 +23,7 @@ internal final class SvgaPlayerView: UIView {
     var onFrame: FrameHandler?
     var onLoop: LoopHandler?
     var onFinish: FinishHandler?
+    var onWindowVisibilityChange: WindowVisibilityHandler?
 
     private(set) var isPlaying: Bool = false
 
@@ -39,6 +41,11 @@ internal final class SvgaPlayerView: UIView {
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        onWindowVisibilityChange?(window != nil)
+    }
 
     func start() {
         if isPlaying { return }
@@ -103,12 +110,12 @@ internal final class SvgaPlayerView: UIView {
         ctx.scaleBy(x: scale.scaleX, y: scale.scaleY)
 
         for sprite in movie.sprites {
-            drawSprite(ctx: ctx, sprite: sprite, entity: e, viewHeight: bounds.height)
+            drawSprite(ctx: ctx, sprite: sprite, entity: e)
         }
         ctx.restoreGState()
     }
 
-    private func drawSprite(ctx: CGContext, sprite: SpriteEntity, entity: SvgaEntity, viewHeight: CGFloat) {
+    private func drawSprite(ctx: CGContext, sprite: SpriteEntity, entity: SvgaEntity) {
         let frames = sprite.frames
         if currentFrame >= frames.count { return }
         let frame = frames[currentFrame]
@@ -121,10 +128,6 @@ internal final class SvgaPlayerView: UIView {
         ctx.saveGState()
         ctx.setAlpha(frame.alpha)
         ctx.concatenate(frame.transform)
-        ctx.translateBy(x: frame.layout.origin.x, y: frame.layout.origin.y)
-        let layoutW = frame.layout.size.width
-        let layoutH = frame.layout.size.height
-        ctx.scaleBy(x: layoutW / bw, y: layoutH / bh)
         ctx.translateBy(x: 0, y: bh)
         ctx.scaleBy(x: 1, y: -1)
         ctx.draw(image, in: CGRect(x: 0, y: 0, width: bw, height: bh))

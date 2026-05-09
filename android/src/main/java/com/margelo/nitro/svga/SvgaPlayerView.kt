@@ -3,7 +3,6 @@ package com.margelo.nitro.svga
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
 import android.graphics.Paint
 import android.os.Handler
 import android.os.Looper
@@ -28,9 +27,12 @@ internal class SvgaPlayerView(context: Context) : View(context) {
   var maxLoops: Int = 0
   var frameInterval: Long = DEFAULT_FRAME_INTERVAL
 
+  fun interface WindowVisibilityListener { fun onVisibilityChanged(visible: Boolean) }
+
   var onFrame: FrameListener? = null
   var onLoop: LoopListener? = null
   var onFinish: FinishListener? = null
+  var onWindowVisibilityChange: WindowVisibilityListener? = null
 
   private var currentFrame = 0
   private var loopCount = 0
@@ -40,7 +42,6 @@ internal class SvgaPlayerView(context: Context) : View(context) {
   fun isPlaying(): Boolean = playing
 
   private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-  private val drawMatrix = Matrix()
   private val handler = Handler(Looper.getMainLooper())
 
   init {
@@ -114,8 +115,14 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     canvas.restore()
   }
 
+  override fun onAttachedToWindow() {
+    super.onAttachedToWindow()
+    onWindowVisibilityChange?.onVisibilityChanged(true)
+  }
+
   override fun onDetachedFromWindow() {
     super.onDetachedFromWindow()
+    onWindowVisibilityChange?.onVisibilityChanged(false)
     release()
   }
 
@@ -130,11 +137,7 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     if (bw <= 0 || bh <= 0) return
 
     paint.alpha = (frame.alpha * 255f).toInt().coerceIn(0, 255)
-
-    drawMatrix.set(frame.transform)
-    drawMatrix.preTranslate(frame.layout.left, frame.layout.top)
-    drawMatrix.preScale(frame.layout.width() / bw, frame.layout.height() / bh)
-    canvas.drawBitmap(bitmap, drawMatrix, paint)
+    canvas.drawBitmap(bitmap, frame.transform, paint)
   }
 
   private fun reset() {

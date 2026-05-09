@@ -4,6 +4,9 @@ internal enum SvgaSourceLoader {
 
     private static let MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 
+    private static var inFlight: [String: [(Result<SvgaEntity, Error>) -> Void]] = [:]
+    private static let inFlightQueue = DispatchQueue(label: "svga.loader.inflight")
+
     private static let session: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 15
@@ -18,19 +21,40 @@ internal enum SvgaSourceLoader {
             completion(.success(cached))
             return
         }
+
+        var shouldStart = false
+        inFlightQueue.sync {
+            if inFlight[source] == nil {
+                inFlight[source] = [completion]
+                shouldStart = true
+            } else {
+                inFlight[source]?.append(completion)
+            }
+        }
+        if !shouldStart { return }
+
         loadData(source) { result in
             switch result {
-            case .failure(let err): completion(.failure(err))
+            case .failure(let err):
+                fanOut(source: source, result: .failure(err))
             case .success(let data):
                 do {
                     let parsed = try SvgaParser.parse(data)
                     SvgaMemoryCache.shared.put(source, parsed)
-                    completion(.success(parsed))
+                    fanOut(source: source, result: .success(parsed))
                 } catch {
-                    completion(.failure(error))
+                    fanOut(source: source, result: .failure(error))
                 }
             }
         }
+    }
+
+    private static func fanOut(source: String, result: Result<SvgaEntity, Error>) {
+        var callbacks: [(Result<SvgaEntity, Error>) -> Void] = []
+        inFlightQueue.sync {
+            callbacks = inFlight.removeValue(forKey: source) ?? []
+        }
+        for cb in callbacks { cb(result) }
     }
 
     static func preloadRemote(_ url: String, completion: @escaping (Result<URL, Error>) -> Void) {

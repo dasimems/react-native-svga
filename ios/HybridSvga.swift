@@ -42,6 +42,8 @@ final class HybridSvga: HybridSvgaSpec {
         didSet { audio.setVolume(Float(builtInAudioVolume)) }
     }
 
+    var playInBackground: Bool = false
+
     var scaleMode: ScaleMode = .aspectfit {
         didSet { playerView.scaleMode = scaleMode }
     }
@@ -63,6 +65,17 @@ final class HybridSvga: HybridSvgaSpec {
             self?.audio.stopAll()
             self?.onFinish?()
         }
+        playerView.onWindowVisibilityChange = { [weak self] visible in
+            guard let self = self else { return }
+            if visible { return }
+            if self.playInBackground { return }
+            self.handleWindowGone()
+        }
+    }
+
+    private func handleWindowGone() {
+        playerView.pause()
+        audio.stopAll()
     }
 
     func play() throws {

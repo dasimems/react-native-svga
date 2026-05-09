@@ -58,6 +58,8 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   override var builtInAudioVolume: Double = 1.0
     set(value) { field = value; audio.setVolume(value.toFloat()) }
 
+  override var playInBackground: Boolean = false
+
   override var scaleMode: ScaleMode = ScaleMode.ASPECTFIT
     set(value) { field = value; playerView.scaleMode = value }
 
@@ -73,6 +75,16 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
       audio.stopAll()
       onFinish?.invoke()
     }
+    playerView.onWindowVisibilityChange = SvgaPlayerView.WindowVisibilityListener { visible ->
+      if (visible) return@WindowVisibilityListener
+      if (playInBackground) return@WindowVisibilityListener
+      handleWindowGone()
+    }
+  }
+
+  private fun handleWindowGone() {
+    playerView.pause()
+    audio.stopAll()
   }
 
   override fun play() {

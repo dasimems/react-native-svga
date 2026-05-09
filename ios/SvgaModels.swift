@@ -29,11 +29,18 @@ internal struct SpriteEntity {
     let frames: [FrameEntity]
 }
 
-internal struct FrameEntity {
+internal final class FrameEntity {
     let alpha: CGFloat
     let layout: CGRect
-    let transform: CGAffineTransform
+    var transform: CGAffineTransform
     let hasContent: Bool
+
+    init(alpha: CGFloat, layout: CGRect, transform: CGAffineTransform, hasContent: Bool) {
+        self.alpha = alpha
+        self.layout = layout
+        self.transform = transform
+        self.hasContent = hasContent
+    }
 }
 
 internal struct AudioEntity {
