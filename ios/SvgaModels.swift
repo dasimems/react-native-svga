@@ -11,6 +11,11 @@ internal struct SvgaEntity {
         var total = 0
         for (_, img) in images { total += img.bytesPerRow * img.height }
         for (_, data) in audioData { total += data.count }
+        var totalFrames = 0
+        for sprite in movie.sprites { totalFrames += sprite.frames.count }
+        // FrameEntity ~80 B per frame; SpriteEntity overhead ~64 B.
+        total += totalFrames * 80
+        total += movie.sprites.count * 64
         return total
     }
 }

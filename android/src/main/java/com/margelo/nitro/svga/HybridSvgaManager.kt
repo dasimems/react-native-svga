@@ -20,10 +20,23 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
     ?: throw IllegalStateException("Application context unavailable")
   private val sounds = SvgaSoundLibrary(context)
 
+  init { SvgaMemoryCache.ensureInit(context) }
+
   override fun preload(urls: Array<String>): Promise<Unit> {
     return Promise.async(scope) {
       urls.map { source ->
         async { preloadOne(source) }
+      }.awaitAll()
+      Unit
+    }
+  }
+
+  override fun preloadDecoded(urls: Array<String>): Promise<Unit> {
+    return Promise.async(scope) {
+      urls.map { source ->
+        async {
+          try { SvgaSourceLoader.loadEntity(context, source) } catch (_: Throwable) {}
+        }
       }.awaitAll()
       Unit
     }
@@ -52,6 +65,10 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
 
   override fun setCacheLimit(bytes: Double) {
     SvgaDiskCache.setMaxBytes(bytes.toLong())
+  }
+
+  override fun setMemoryLimit(bytes: Double) {
+    SvgaMemoryCache.setMaxBytes(bytes.toLong())
   }
 
   override fun loadSound(key: String, url: String): Promise<Unit> {

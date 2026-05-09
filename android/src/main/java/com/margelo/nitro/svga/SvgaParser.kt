@@ -220,21 +220,21 @@ internal object SvgaParser {
       when (tag.field) {
         1 -> reader.readString() // version, ignored
         2 -> {
-          val params = parseParams(reader.readBytes())
+          val params = parseParams(reader.readSubReader())
           width = params.viewBoxWidth
           height = params.viewBoxHeight
           fps = params.fps
           frames = params.frames
         }
         3 -> {
-          val entry = parseImageEntry(reader.readBytes())
+          val entry = parseImageEntry(reader.readSubReader())
           inlineBlobs[entry.key] = entry.value
         }
         4 -> {
           if (sprites.size >= MAX_SPRITES) throw SvgaParseException("too many sprites")
-          sprites.add(parseSprite(reader.readBytes()))
+          sprites.add(parseSprite(reader.readSubReader()))
         }
-        5 -> audios.add(parseAudio(reader.readBytes()))
+        5 -> audios.add(parseAudio(reader.readSubReader()))
         else -> reader.skip(tag.wire)
       }
     }
@@ -244,8 +244,7 @@ internal object SvgaParser {
 
   private data class MovieParams(val viewBoxWidth: Float, val viewBoxHeight: Float, val fps: Int, val frames: Int)
 
-  private fun parseParams(bytes: ByteArray): MovieParams {
-    val r = ProtoReader(bytes)
+  private fun parseParams(r: ProtoReader): MovieParams {
     var width = 0f
     var height = 0f
     var fps = DEFAULT_FPS
@@ -268,8 +267,7 @@ internal object SvgaParser {
 
   private data class ImageEntry(val key: String, val value: ByteArray)
 
-  private fun parseImageEntry(bytes: ByteArray): ImageEntry {
-    val r = ProtoReader(bytes)
+  private fun parseImageEntry(r: ProtoReader): ImageEntry {
     var key = ""
     var value = ByteArray(0)
     while (r.hasMore()) {
@@ -283,23 +281,21 @@ internal object SvgaParser {
     return ImageEntry(key, value)
   }
 
-  private fun parseSprite(bytes: ByteArray): SpriteEntity {
-    val r = ProtoReader(bytes)
+  private fun parseSprite(r: ProtoReader): SpriteEntity {
     var imageKey = ""
     val frames = ArrayList<FrameEntity>()
     while (r.hasMore()) {
       val tag = r.readTag()
       when (tag.field) {
         1 -> imageKey = r.readString()
-        2 -> frames.add(parseFrame(r.readBytes()))
+        2 -> frames.add(parseFrame(r.readSubReader()))
         else -> r.skip(tag.wire)
       }
     }
     return SpriteEntity(imageKey, frames)
   }
 
-  private fun parseFrame(bytes: ByteArray): FrameEntity {
-    val r = ProtoReader(bytes)
+  private fun parseFrame(r: ProtoReader): FrameEntity {
     var alpha = 0f
     var x = 0f; var y = 0f; var w = 0f; var h = 0f
     var a = 1f; var b = 0f; var c = 0f
@@ -314,7 +310,7 @@ internal object SvgaParser {
           hasContent = alpha > 0f
         }
         2 -> {
-          val lr = ProtoReader(r.readBytes())
+          val lr = r.readSubReader()
           while (lr.hasMore()) {
             val lt = lr.readTag()
             when (lt.field) {
@@ -327,7 +323,7 @@ internal object SvgaParser {
           }
         }
         3 -> {
-          val tr = ProtoReader(r.readBytes())
+          val tr = r.readSubReader()
           while (tr.hasMore()) {
             val tt = tr.readTag()
             when (tt.field) {
@@ -350,8 +346,7 @@ internal object SvgaParser {
     return FrameEntity(alpha, RectF(x, y, x + w, y + h), matrix, hasContent)
   }
 
-  private fun parseAudio(bytes: ByteArray): AudioEntity {
-    val r = ProtoReader(bytes)
+  private fun parseAudio(r: ProtoReader): AudioEntity {
     var key = ""
     var startFrame = 0
     var endFrame = 0

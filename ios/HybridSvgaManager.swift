@@ -13,6 +13,21 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
         }
     }
 
+    func preloadDecoded(urls: [String]) throws -> Promise<Void> {
+        return Promise.async {
+            await withTaskGroup(of: Void.self) { group in
+                for source in urls {
+                    group.addTask {
+                        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                            SvgaSourceLoader.loadEntity(source) { _ in cont.resume(returning: ()) }
+                        }
+                    }
+                }
+                for await _ in group { }
+            }
+        }
+    }
+
     func isCached(url: String) throws -> Bool {
         guard let resolved = UrlValidator.resolve(url) else { return false }
         if resolved.kind != .remote { return false }
@@ -38,6 +53,10 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
 
     func setCacheLimit(bytes: Double) throws {
         SvgaDiskCache.setMaxBytes(Int64(bytes))
+    }
+
+    func setMemoryLimit(bytes: Double) throws {
+        SvgaMemoryCache.shared.setMaxBytes(Int(bytes))
     }
 
     func loadSound(key: String, url: String) throws -> Promise<Void> {

@@ -17,6 +17,7 @@ export interface SvgaPlayerHandle {
   stop: () => void;
   seekToFrame: (frame: number) => void;
   seekToProgress: (progress: number) => void;
+  isPlaying: () => boolean;
 }
 
 export interface SvgaPlayerProps {

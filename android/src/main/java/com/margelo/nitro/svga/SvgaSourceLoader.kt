@@ -10,6 +10,7 @@ import java.util.concurrent.ConcurrentHashMap
 import javax.net.ssl.HttpsURLConnection
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 
 internal object SvgaSourceLoader {
@@ -33,7 +34,9 @@ internal object SvgaSourceLoader {
     }
 
     try {
-      val parsed = withContext(Dispatchers.IO) { loadEntityBlocking(ctx, source) }
+      val parsed = withContext(Dispatchers.IO) {
+        runInterruptible { loadEntityBlocking(ctx, source) }
+      }
       SvgaMemoryCache.put(source, parsed)
       deferred.complete(parsed)
       return parsed

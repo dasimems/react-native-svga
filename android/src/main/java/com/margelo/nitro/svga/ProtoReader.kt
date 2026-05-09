@@ -1,6 +1,10 @@
 package com.margelo.nitro.svga
 
-internal class ProtoReader(private val buf: ByteArray) {
+internal class ProtoReader private constructor(
+  private val buf: ByteArray,
+  private val limit: Int,
+  private var pos: Int
+) {
 
   companion object {
     const val WIRE_VARINT = 0
@@ -11,17 +15,17 @@ internal class ProtoReader(private val buf: ByteArray) {
     private const val MAX_VARINT_BYTES = 10
   }
 
+  constructor(bytes: ByteArray) : this(bytes, bytes.size, 0)
+
   data class Tag(val field: Int, val wire: Int)
 
-  private var pos = 0
-
-  fun hasMore(): Boolean = pos < buf.size
+  fun hasMore(): Boolean = pos < limit
 
   fun readVarint(): Long {
     var result = 0L
     var shift = 0
     var read = 0
-    while (pos < buf.size) {
+    while (pos < limit) {
       if (read >= MAX_VARINT_BYTES) throw SvgaParseException("varint too long")
       val b = buf[pos].toLong() and 0xFF
       pos++
@@ -38,20 +42,34 @@ internal class ProtoReader(private val buf: ByteArray) {
     return Tag(raw ushr 3, raw and 0x7)
   }
 
+  fun readSubReader(): ProtoReader {
+    val len = readVarint().toInt()
+    if (len < 0 || pos + len > limit) throw SvgaParseException("length-delimited overflow")
+    val sub = ProtoReader(buf, pos + len, pos)
+    pos += len
+    return sub
+  }
+
   fun readBytes(): ByteArray {
     val len = readVarint().toInt()
-    if (len < 0 || pos + len > buf.size) throw SvgaParseException("length-delimited overflow")
+    if (len < 0 || pos + len > limit) throw SvgaParseException("length-delimited overflow")
     val data = buf.copyOfRange(pos, pos + len)
     pos += len
     return data
   }
 
-  fun readString(): String = String(readBytes(), Charsets.UTF_8)
+  fun readString(): String {
+    val len = readVarint().toInt()
+    if (len < 0 || pos + len > limit) throw SvgaParseException("length-delimited overflow")
+    val s = String(buf, pos, len, Charsets.UTF_8)
+    pos += len
+    return s
+  }
 
   fun readInt32(): Int = readVarint().toInt()
 
   fun readFloat(): Float {
-    if (pos + 4 > buf.size) throw SvgaParseException("truncated float")
+    if (pos + 4 > limit) throw SvgaParseException("truncated float")
     val bits = (buf[pos].toInt() and 0xFF) or
       ((buf[pos + 1].toInt() and 0xFF) shl 8) or
       ((buf[pos + 2].toInt() and 0xFF) shl 16) or
@@ -64,14 +82,20 @@ internal class ProtoReader(private val buf: ByteArray) {
     when (wire) {
       WIRE_VARINT -> readVarint()
       WIRE_FIXED64 -> advance(8)
-      WIRE_LENGTH_DELIMITED -> readBytes()
+      WIRE_LENGTH_DELIMITED -> skipBytes()
       WIRE_FIXED32 -> advance(4)
       else -> throw SvgaParseException("unknown wire type $wire")
     }
   }
 
+  private fun skipBytes() {
+    val len = readVarint().toInt()
+    if (len < 0 || pos + len > limit) throw SvgaParseException("length-delimited overflow")
+    pos += len
+  }
+
   private fun advance(n: Int) {
-    if (pos + n > buf.size) throw SvgaParseException("truncated fixed field")
+    if (pos + n > limit) throw SvgaParseException("truncated fixed field")
     pos += n
   }
 }

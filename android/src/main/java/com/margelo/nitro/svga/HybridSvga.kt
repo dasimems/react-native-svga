@@ -26,6 +26,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   private var loadJob: Job? = null
   private var entity: SvgaEntity? = null
   private var pendingPlayOnLoad = false
+  private var wasPlayingBeforeWindowGone = false
 
   override val view: View = playerView
 
@@ -69,6 +70,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   override var onError: ((message: String) -> Unit)? = null
 
   init {
+    SvgaMemoryCache.ensureInit(context.applicationContext)
     playerView.onFrame = SvgaPlayerView.FrameListener { frame, _ -> audio.onFrame(frame) }
     playerView.onLoop = SvgaPlayerView.LoopListener { count -> onLoop?.invoke(count.toDouble()) }
     playerView.onFinish = SvgaPlayerView.FinishListener {
@@ -76,15 +78,22 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
       onFinish?.invoke()
     }
     playerView.onWindowVisibilityChange = SvgaPlayerView.WindowVisibilityListener { visible ->
-      if (visible) return@WindowVisibilityListener
       if (playInBackground) return@WindowVisibilityListener
-      handleWindowGone()
+      if (visible) handleWindowReturned() else handleWindowGone()
     }
   }
 
   private fun handleWindowGone() {
+    wasPlayingBeforeWindowGone = playerView.isPlaying()
     playerView.pause()
-    audio.stopAll()
+    audio.pauseAll()
+  }
+
+  private fun handleWindowReturned() {
+    if (!wasPlayingBeforeWindowGone) return
+    wasPlayingBeforeWindowGone = false
+    playerView.start()
+    audio.resumeAll()
   }
 
   override fun play() {
@@ -116,6 +125,8 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
     val clamped = progress.coerceIn(0.0, 1.0)
     playerView.seekToFrame((clamped * total).toInt())
   }
+
+  override fun isPlaying(): Boolean = playerView.isPlaying()
 
   override fun onDestroy() {
     loadJob?.cancel()

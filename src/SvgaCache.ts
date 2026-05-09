@@ -7,6 +7,9 @@ export const svgaManager =
 export const SvgaCache = {
   preload: (urls: string[]): Promise<void> => svgaManager.preload(urls),
 
+  preloadDecoded: (urls: string[]): Promise<void> =>
+    svgaManager.preloadDecoded(urls),
+
   has: (url: string): boolean => svgaManager.isCached(url),
 
   path: (url: string): string | null => svgaManager.getCachePath(url),
@@ -16,4 +19,6 @@ export const SvgaCache = {
   size: (): Promise<number> => svgaManager.getCacheSize(),
 
   setLimit: (bytes: number): void => svgaManager.setCacheLimit(bytes),
+
+  setMemoryLimit: (bytes: number): void => svgaManager.setMemoryLimit(bytes),
 };

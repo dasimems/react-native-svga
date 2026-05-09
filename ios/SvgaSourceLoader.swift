@@ -4,8 +4,16 @@ internal enum SvgaSourceLoader {
 
     private static let MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 
-    private static var inFlight: [String: [(Result<SvgaEntity, Error>) -> Void]] = [:]
+    private static var inFlight: [String: InFlightLoad] = [:]
     private static let inFlightQueue = DispatchQueue(label: "svga.loader.inflight")
+
+    private final class InFlightLoad {
+        var callbacks: [(Result<SvgaEntity, Error>) -> Void]
+        var task: URLSessionDataTask?
+        init(_ callback: @escaping (Result<SvgaEntity, Error>) -> Void) {
+            self.callbacks = [callback]
+        }
+    }
 
     private static let session: URLSession = {
         let config = URLSessionConfiguration.default
@@ -25,15 +33,15 @@ internal enum SvgaSourceLoader {
         var shouldStart = false
         inFlightQueue.sync {
             if inFlight[source] == nil {
-                inFlight[source] = [completion]
+                inFlight[source] = InFlightLoad(completion)
                 shouldStart = true
             } else {
-                inFlight[source]?.append(completion)
+                inFlight[source]?.callbacks.append(completion)
             }
         }
         if !shouldStart { return }
 
-        loadData(source) { result in
+        loadData(source, attachTaskFor: source) { result in
             switch result {
             case .failure(let err):
                 fanOut(source: source, result: .failure(err))
@@ -49,10 +57,19 @@ internal enum SvgaSourceLoader {
         }
     }
 
+    static func cancelLoad(_ source: String) {
+        var task: URLSessionDataTask?
+        inFlightQueue.sync {
+            task = inFlight[source]?.task
+            inFlight.removeValue(forKey: source)
+        }
+        task?.cancel()
+    }
+
     private static func fanOut(source: String, result: Result<SvgaEntity, Error>) {
         var callbacks: [(Result<SvgaEntity, Error>) -> Void] = []
         inFlightQueue.sync {
-            callbacks = inFlight.removeValue(forKey: source) ?? []
+            callbacks = inFlight.removeValue(forKey: source)?.callbacks ?? []
         }
         for cb in callbacks { cb(result) }
     }
@@ -114,7 +131,7 @@ internal enum SvgaSourceLoader {
         }
     }
 
-    private static func loadData(_ source: String, completion: @escaping (Result<Data, Error>) -> Void) {
+    private static func loadData(_ source: String, attachTaskFor sourceForCancel: String? = nil, completion: @escaping (Result<Data, Error>) -> Void) {
         guard let resolved = UrlValidator.resolve(source) else {
             completion(.failure(SvgaError("invalid source: \(source)")))
             return
@@ -146,7 +163,7 @@ internal enum SvgaSourceLoader {
             }
             return
         }
-        download(resolved.value) { result in
+        download(resolved.value, attachTaskFor: sourceForCancel) { result in
             switch result {
             case .failure(let err): completion(.failure(err))
             case .success(let data):
@@ -156,7 +173,7 @@ internal enum SvgaSourceLoader {
         }
     }
 
-    private static func download(_ urlString: String, completion: @escaping (Result<Data, Error>) -> Void) {
+    private static func download(_ urlString: String, attachTaskFor sourceForCancel: String? = nil, completion: @escaping (Result<Data, Error>) -> Void) {
         guard let url = URL(string: urlString) else {
             completion(.failure(SvgaError("invalid url: \(urlString)")))
             return
@@ -183,6 +200,9 @@ internal enum SvgaSourceLoader {
                 return
             }
             completion(.success(data))
+        }
+        if let key = sourceForCancel {
+            inFlightQueue.sync { inFlight[key]?.task = task }
         }
         task.resume()
     }

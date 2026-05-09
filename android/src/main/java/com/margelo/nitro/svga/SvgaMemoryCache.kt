@@ -1,18 +1,38 @@
 package com.margelo.nitro.svga
 
+import android.app.ActivityManager
+import android.content.ComponentCallbacks2
+import android.content.Context
+import android.content.res.Configuration
 import android.util.LruCache
 
 internal object SvgaMemoryCache {
 
   private const val DEFAULT_LIMIT_BYTES = 32L * 1024 * 1024
+  private const val LOW_RAM_LIMIT_BYTES = 8L * 1024 * 1024
   private const val ENTRY_HEADROOM = 1024L
 
-  @Volatile
-  private var cache: LruCache<String, SvgaEntity> = build(DEFAULT_LIMIT_BYTES)
+  @Volatile private var initialized = false
+  @Volatile private var explicitLimit: Long? = null
+  @Volatile private var cache: LruCache<String, SvgaEntity> = build(DEFAULT_LIMIT_BYTES)
+
+  fun ensureInit(context: Context) {
+    if (initialized) return
+    synchronized(this) {
+      if (initialized) return
+      val app = context.applicationContext
+      val limit = explicitLimit ?: defaultLimitFor(app)
+      cache.evictAll()
+      cache = build(limit)
+      app.registerComponentCallbacks(memoryCallbacks)
+      initialized = true
+    }
+  }
 
   fun setMaxBytes(bytes: Long) {
     val safe = bytes.coerceAtLeast(0L)
     synchronized(this) {
+      explicitLimit = safe
       cache.evictAll()
       cache = build(safe)
     }
@@ -27,6 +47,21 @@ internal object SvgaMemoryCache {
 
   fun clear() { cache.evictAll() }
 
+  fun trimToHalf() {
+    val target = (cache.size() / 2).coerceAtLeast(0)
+    cache.trimToSize(target)
+  }
+
+  private fun defaultLimitFor(context: Context): Long {
+    val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return DEFAULT_LIMIT_BYTES
+    return when {
+      am.isLowRamDevice -> LOW_RAM_LIMIT_BYTES
+      am.memoryClass < 128 -> LOW_RAM_LIMIT_BYTES
+      am.memoryClass < 256 -> DEFAULT_LIMIT_BYTES / 2
+      else -> DEFAULT_LIMIT_BYTES
+    }
+  }
+
   private fun build(limit: Long): LruCache<String, SvgaEntity> {
     val cap = limit.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     return object : LruCache<String, SvgaEntity>(cap) {
@@ -35,5 +70,19 @@ internal object SvgaMemoryCache {
         return raw.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
       }
     }
+  }
+
+  private val memoryCallbacks = object : ComponentCallbacks2 {
+    override fun onTrimMemory(level: Int) {
+      when {
+        level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> clear()
+        level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> trimToHalf()
+        level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN -> trimToHalf()
+        else -> Unit
+      }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {}
+    override fun onLowMemory() { clear() }
   }
 }

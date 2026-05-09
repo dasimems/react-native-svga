@@ -31,6 +31,7 @@ export interface SvgaMethods extends HybridViewMethods {
   stop(): void;
   seekToFrame(frame: number): void;
   seekToProgress(progress: number): void;
+  isPlaying(): boolean;
 }
 
 export type Svga = HybridView<SvgaProps, SvgaMethods>;

@@ -18,6 +18,7 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     set(value) {
       field = value
       reset()
+      hasRendered = false
       invalidate()
     }
 
@@ -37,6 +38,7 @@ internal class SvgaPlayerView(context: Context) : View(context) {
   private var currentFrame = 0
   private var loopCount = 0
   private var playing = false
+  private var hasRendered = false
   private var nextFrameAt = 0L
 
   fun isPlaying(): Boolean = playing
@@ -66,6 +68,11 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     if (entity == null) return
     playing = true
     nextFrameAt = System.currentTimeMillis() + frameInterval
+    if (!hasRendered) {
+      hasRendered = true
+      onFrame?.onFrame(currentFrame, false)
+      invalidate()
+    }
     handler.postDelayed(tick, frameInterval)
   }
 
@@ -86,6 +93,7 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     val total = entity?.movie?.frames ?: return
     if (total <= 0) return
     currentFrame = frame.coerceIn(0, total - 1)
+    if (playing) onFrame?.onFrame(currentFrame, false)
     invalidate()
   }
 
@@ -143,6 +151,7 @@ internal class SvgaPlayerView(context: Context) : View(context) {
   private fun reset() {
     currentFrame = 0
     loopCount = 0
+    hasRendered = false
   }
 
   private fun advance() {

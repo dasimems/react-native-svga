@@ -7,12 +7,10 @@ internal final class SvgaAudioEngine {
         let player: AVAudioPlayer
         let startFrame: Int
         let endFrame: Int
-        let tempURL: URL
-        init(player: AVAudioPlayer, startFrame: Int, endFrame: Int, tempURL: URL) {
+        init(player: AVAudioPlayer, startFrame: Int, endFrame: Int) {
             self.player = player
             self.startFrame = startFrame
             self.endFrame = endFrame
-            self.tempURL = tempURL
         }
     }
 
@@ -45,10 +43,8 @@ internal final class SvgaAudioEngine {
         if entity.movie.audios.isEmpty { return }
         for audio in entity.movie.audios {
             guard let bytes = entity.audioData[audio.audioKey] else { continue }
-            let tmp = uniqueTempURL(for: audio.audioKey)
             do {
-                try bytes.write(to: tmp, options: .atomic)
-                let player = try AVAudioPlayer(contentsOf: tmp)
+                let player = try AVAudioPlayer(data: bytes)
                 player.prepareToPlay()
                 player.volume = volume
                 player.enableRate = true
@@ -56,11 +52,10 @@ internal final class SvgaAudioEngine {
                 tracks.append(Track(
                     player: player,
                     startFrame: audio.startFrame,
-                    endFrame: audio.endFrame,
-                    tempURL: tmp
+                    endFrame: audio.endFrame
                 ))
             } catch {
-                try? FileManager.default.removeItem(at: tmp)
+                continue
             }
         }
     }
@@ -99,14 +94,7 @@ internal final class SvgaAudioEngine {
     private func unload() {
         for track in tracks {
             track.player.stop()
-            try? FileManager.default.removeItem(at: track.tempURL)
         }
         tracks.removeAll()
-    }
-
-    private func uniqueTempURL(for key: String) -> URL {
-        let dir = FileManager.default.temporaryDirectory
-        let safeKey = Hashing.sha256(key).prefix(16)
-        return dir.appendingPathComponent("svga-audio-\(safeKey)-\(UUID().uuidString).bin")
     }
 }

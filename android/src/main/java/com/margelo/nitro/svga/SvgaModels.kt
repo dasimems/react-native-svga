@@ -15,6 +15,11 @@ internal data class SvgaEntity(
     var total = 0L
     for (bmp in bitmaps.values) total += bmp.byteCount.toLong()
     for (bytes in audioData.values) total += bytes.size.toLong()
+    var totalFrames = 0
+    for (sprite in movie.sprites) totalFrames += sprite.frames.size
+    // FrameEntity (Matrix + RectF + flags) ~80 B per frame; SpriteEntity overhead ~64 B.
+    total += totalFrames.toLong() * 80L
+    total += movie.sprites.size.toLong() * 64L
     return total
   }
 }

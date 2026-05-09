@@ -12,6 +12,7 @@ internal final class SvgaPlayerView: UIView {
     var entity: SvgaEntity? {
         didSet {
             reset()
+            hasRendered = false
             setNeedsDisplay()
         }
     }
@@ -29,6 +30,7 @@ internal final class SvgaPlayerView: UIView {
 
     private var currentFrame: Int = 0
     private var loopCount: Int = 0
+    private var hasRendered: Bool = false
     private var displayLink: CADisplayLink?
     private var lastTickAt: CFTimeInterval = 0
 
@@ -52,6 +54,11 @@ internal final class SvgaPlayerView: UIView {
         if entity == nil { return }
         isPlaying = true
         lastTickAt = CACurrentMediaTime()
+        if !hasRendered {
+            hasRendered = true
+            onFrame?(currentFrame, false)
+            setNeedsDisplay()
+        }
         let link = CADisplayLink(target: WeakProxy(self), selector: #selector(WeakProxy.tick))
         link.add(to: .main, forMode: .common)
         displayLink = link
@@ -75,6 +82,7 @@ internal final class SvgaPlayerView: UIView {
     func seekToFrame(_ frame: Int) {
         guard let total = entity?.movie.frames, total > 0 else { return }
         currentFrame = max(0, min(total - 1, frame))
+        if isPlaying { onFrame?(currentFrame, false) }
         setNeedsDisplay()
     }
 
@@ -137,6 +145,7 @@ internal final class SvgaPlayerView: UIView {
     private func reset() {
         currentFrame = 0
         loopCount = 0
+        hasRendered = false
     }
 
     private func advance() {

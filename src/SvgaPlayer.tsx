@@ -48,6 +48,17 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
     const hybridRef = useRef<Svga | null>(null);
     const effectiveMute = shouldMuteBuiltInAudio(muteBuiltInAudio, sounds);
 
+    const soundsRef = useRef(sounds);
+    soundsRef.current = sounds;
+    const onStartRef = useRef(onStart);
+    onStartRef.current = onStart;
+    const onFinishRef = useRef(onFinish);
+    onFinishRef.current = onFinish;
+    const onLoopRef = useRef(onLoop);
+    onLoopRef.current = onLoop;
+    const onErrorRef = useRef(onError);
+    onErrorRef.current = onError;
+
     useImperativeHandle(
       ref,
       (): SvgaPlayerHandle => ({
@@ -56,6 +67,7 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
         stop: () => hybridRef.current?.stop(),
         seekToFrame: (f) => hybridRef.current?.seekToFrame(f),
         seekToProgress: (p) => hybridRef.current?.seekToProgress(p),
+        isPlaying: () => hybridRef.current?.isPlaying() ?? false,
       }),
       []
     );
@@ -79,9 +91,16 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
 
     useEffect(() => {
       if (playInBackground) return undefined;
+      let wasPlayingForBg = false;
       const onChange = (state: AppStateStatus) => {
-        if (state === 'active') return;
-        hybridRef.current?.pause();
+        if (state === 'active') {
+          if (!wasPlayingForBg) return;
+          wasPlayingForBg = false;
+          hybridRef.current?.play();
+          return;
+        }
+        wasPlayingForBg = hybridRef.current?.isPlaying() ?? false;
+        if (wasPlayingForBg) hybridRef.current?.pause();
       };
       const subscription = AppState.addEventListener('change', onChange);
       return () => subscription.remove();
@@ -95,24 +114,22 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
     }, []);
 
     const handleStart = useCallback(() => {
-      playSoundsForTrigger(svgaManager, sounds, 'start');
-      onStart?.();
-    }, [sounds, onStart]);
+      playSoundsForTrigger(svgaManager, soundsRef.current, 'start');
+      onStartRef.current?.();
+    }, []);
 
     const handleFinish = useCallback(() => {
-      playSoundsForTrigger(svgaManager, sounds, 'finish');
-      onFinish?.();
-    }, [sounds, onFinish]);
+      playSoundsForTrigger(svgaManager, soundsRef.current, 'finish');
+      onFinishRef.current?.();
+    }, []);
 
-    const handleLoop = useCallback(
-      (count: number) => onLoop?.(count),
-      [onLoop]
-    );
+    const handleLoop = useCallback((count: number) => {
+      onLoopRef.current?.(count);
+    }, []);
 
-    const handleError = useCallback(
-      (message: string) => onError?.(message),
-      [onError]
-    );
+    const handleError = useCallback((message: string) => {
+      onErrorRef.current?.(message);
+    }, []);
 
     const captureRef = useCallback((value: Svga) => {
       hybridRef.current = value;

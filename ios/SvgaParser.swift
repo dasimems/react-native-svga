@@ -173,19 +173,19 @@ internal enum SvgaParser {
             case 1:
                 _ = try reader.readString() // version, ignored
             case 2:
-                let params = try parseParams(try reader.readBytes())
+                let params = try parseParams(try reader.readSubReader())
                 width = CGFloat(params.viewBoxWidth)
                 height = CGFloat(params.viewBoxHeight)
                 fps = params.fps
                 frames = params.frames
             case 3:
-                let entry = try parseImageEntry(try reader.readBytes())
+                let entry = try parseImageEntry(try reader.readSubReader())
                 inlineBlobs[entry.key] = entry.value
             case 4:
                 if sprites.count >= MAX_SPRITES { throw SvgaError("too many sprites") }
-                sprites.append(try parseSprite(try reader.readBytes()))
+                sprites.append(try parseSprite(try reader.readSubReader()))
             case 5:
-                audios.append(try parseAudio(try reader.readBytes()))
+                audios.append(try parseAudio(try reader.readSubReader()))
             default:
                 try reader.skip(wire: tag.wire)
             }
@@ -209,8 +209,7 @@ internal enum SvgaParser {
         let frames: Int
     }
 
-    private static func parseParams(_ data: Data) throws -> MovieParams {
-        let r = ProtoReader(data)
+    private static func parseParams(_ r: ProtoReader) throws -> MovieParams {
         var width: Float = 0
         var height: Float = 0
         var fps = DEFAULT_FPS
@@ -232,8 +231,7 @@ internal enum SvgaParser {
 
     private struct ImageEntry { let key: String; let value: Data }
 
-    private static func parseImageEntry(_ data: Data) throws -> ImageEntry {
-        let r = ProtoReader(data)
+    private static func parseImageEntry(_ r: ProtoReader) throws -> ImageEntry {
         var key = ""
         var value = Data()
         while r.hasMore {
@@ -247,8 +245,7 @@ internal enum SvgaParser {
         return ImageEntry(key: key, value: value)
     }
 
-    private static func parseSprite(_ data: Data) throws -> SpriteEntity {
-        let r = ProtoReader(data)
+    private static func parseSprite(_ r: ProtoReader) throws -> SpriteEntity {
         var imageKey = ""
         var frames: [FrameEntity] = []
         while r.hasMore {
@@ -262,8 +259,7 @@ internal enum SvgaParser {
         return SpriteEntity(imageKey: imageKey, frames: frames)
     }
 
-    private static func parseFrame(_ data: Data) throws -> FrameEntity {
-        let r = ProtoReader(data)
+    private static func parseFrame(_ r: ProtoReader) throws -> FrameEntity {
         var alpha: Float = 0
         var x: Float = 0, y: Float = 0, w: Float = 0, h: Float = 0
         var a: Float = 1, b: Float = 0, c: Float = 0, d: Float = 1, tx: Float = 0, ty: Float = 0
@@ -276,7 +272,7 @@ internal enum SvgaParser {
                 alpha = try r.readFloat()
                 hasContent = alpha > 0
             case 2:
-                let lr = ProtoReader(try r.readBytes())
+                let lr = try r.readSubReader()
                 while lr.hasMore {
                     let lt = try lr.readTag()
                     switch lt.field {
@@ -288,7 +284,7 @@ internal enum SvgaParser {
                     }
                 }
             case 3:
-                let tr = ProtoReader(try r.readBytes())
+                let tr = try r.readSubReader()
                 while tr.hasMore {
                     let tt = try tr.readTag()
                     switch tt.field {
@@ -315,8 +311,7 @@ internal enum SvgaParser {
         return FrameEntity(alpha: CGFloat(alpha), layout: layout, transform: transform, hasContent: hasContent)
     }
 
-    private static func parseAudio(_ data: Data) throws -> AudioEntity {
-        let r = ProtoReader(data)
+    private static func parseAudio(_ r: ProtoReader) throws -> AudioEntity {
         var key = ""
         var startFrame = 0
         var endFrame = 0

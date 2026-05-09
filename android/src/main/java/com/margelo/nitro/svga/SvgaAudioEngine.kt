@@ -2,6 +2,7 @@ package com.margelo.nitro.svga
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.MediaDataSource
 import android.media.MediaPlayer
 import android.media.PlaybackParams
 import android.os.Build
@@ -13,7 +14,8 @@ internal class SvgaAudioEngine(private val context: Context) {
     val player: MediaPlayer,
     val startFrame: Int,
     val endFrame: Int,
-    val tempFile: File
+    val tempFile: File?,
+    val source: BytesMediaDataSource?
   )
 
   private val tracks = mutableListOf<Track>()
@@ -46,14 +48,8 @@ internal class SvgaAudioEngine(private val context: Context) {
     if (entity.movie.audios.isEmpty()) return
     for (audio in entity.movie.audios) {
       val bytes = entity.audioData[audio.audioKey] ?: continue
-      val file = File.createTempFile("svga-audio-${audio.audioKey}-", ".bin", context.cacheDir)
-      try {
-        file.writeBytes(bytes)
-        val player = newPlayer(file) ?: continue
-        tracks.add(Track(player, audio.startFrame, audio.endFrame, file))
-      } catch (_: Exception) {
-        file.delete()
-      }
+      val track = newTrack(audio, bytes) ?: continue
+      tracks.add(track)
     }
   }
 
@@ -94,12 +90,13 @@ internal class SvgaAudioEngine(private val context: Context) {
     for (track in tracks) {
       try { track.player.reset() } catch (_: Exception) {}
       track.player.release()
-      track.tempFile.delete()
+      track.source?.close()
+      track.tempFile?.delete()
     }
     tracks.clear()
   }
 
-  private fun newPlayer(file: File): MediaPlayer? {
+  private fun newTrack(audio: AudioEntity, bytes: ByteArray): Track? {
     val player = MediaPlayer()
     player.setAudioAttributes(
       AudioAttributes.Builder()
@@ -107,14 +104,27 @@ internal class SvgaAudioEngine(private val context: Context) {
         .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
         .build()
     )
+
+    var dataSource: BytesMediaDataSource? = null
+    var tempFile: File? = null
+
     return try {
-      player.setDataSource(file.absolutePath)
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        dataSource = BytesMediaDataSource(bytes)
+        player.setDataSource(dataSource)
+      } else {
+        tempFile = File.createTempFile("svga-audio-${audio.audioKey}-", ".bin", context.cacheDir)
+        tempFile.writeBytes(bytes)
+        player.setDataSource(tempFile.absolutePath)
+      }
       player.prepare()
       player.setVolume(volume, volume)
       applyRate(player)
-      player
+      Track(player, audio.startFrame, audio.endFrame, tempFile, dataSource)
     } catch (_: Exception) {
-      player.release()
+      try { player.release() } catch (_: Exception) {}
+      dataSource?.close()
+      tempFile?.delete()
       null
     }
   }
@@ -143,12 +153,23 @@ internal class SvgaAudioEngine(private val context: Context) {
       val params = PlaybackParams().setSpeed(rate)
       player.playbackParams = params
       if (!wasPlaying) {
-        // setPlaybackParams forces playback to start on some devices; pause again.
         try { if (player.isPlaying) player.pause() } catch (_: IllegalStateException) {}
       }
     } catch (_: Exception) {
-      // Some codecs don't support rate changes; ignore.
     }
+  }
+
+  private class BytesMediaDataSource(private val bytes: ByteArray) : MediaDataSource() {
+    override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+      if (position >= bytes.size) return -1
+      val available = (bytes.size - position.toInt()).coerceAtMost(size)
+      System.arraycopy(bytes, position.toInt(), buffer, offset, available)
+      return available
+    }
+
+    override fun getSize(): Long = bytes.size.toLong()
+
+    override fun close() {}
   }
 
   companion object {

@@ -5,11 +5,13 @@ export interface SvgaManager extends HybridObject<{
   android: 'kotlin';
 }> {
   preload(urls: string[]): Promise<void>;
+  preloadDecoded(urls: string[]): Promise<void>;
   isCached(url: string): boolean;
   getCachePath(url: string): string | null;
   clearCache(): void;
   getCacheSize(): Promise<number>;
   setCacheLimit(bytes: number): void;
+  setMemoryLimit(bytes: number): void;
 
   // Extra sounds (not baked into svga bundle)
   loadSound(key: string, url: string): Promise<void>;

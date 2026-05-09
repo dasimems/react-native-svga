@@ -9,6 +9,8 @@ final class HybridSvga: HybridSvgaSpec {
     private var entityRef: SvgaEntity?
     private var pendingPlayOnLoad = false
     private var loadToken = 0
+    private var activeSource: String?
+    private var wasPlayingBeforeWindowGone = false
     private let defaultFps = 15
     private let minSpeed: Double = 0.05
 
@@ -67,15 +69,22 @@ final class HybridSvga: HybridSvgaSpec {
         }
         playerView.onWindowVisibilityChange = { [weak self] visible in
             guard let self = self else { return }
-            if visible { return }
             if self.playInBackground { return }
-            self.handleWindowGone()
+            if visible { self.handleWindowReturned() } else { self.handleWindowGone() }
         }
     }
 
     private func handleWindowGone() {
+        wasPlayingBeforeWindowGone = playerView.isPlaying
         playerView.pause()
-        audio.stopAll()
+        audio.pauseAll()
+    }
+
+    private func handleWindowReturned() {
+        if !wasPlayingBeforeWindowGone { return }
+        wasPlayingBeforeWindowGone = false
+        playerView.start()
+        audio.resumeAll()
     }
 
     func play() throws {
@@ -109,21 +118,28 @@ final class HybridSvga: HybridSvgaSpec {
         playerView.seekToFrame(Int(clamped * Double(total)))
     }
 
+    func isPlaying() throws -> Bool { playerView.isPlaying }
+
     deinit {
         playerView.release()
         audio.release()
     }
 
     private func handleSource(_ value: String) {
+        if let previous = activeSource, previous != value {
+            SvgaSourceLoader.cancelLoad(previous)
+        }
         loadToken += 1
         let token = loadToken
         if value.isEmpty {
+            activeSource = nil
             entityRef = nil
             playerView.stop()
             playerView.entity = nil
             audio.stopAll()
             return
         }
+        activeSource = value
         SvgaSourceLoader.loadEntity(value) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }

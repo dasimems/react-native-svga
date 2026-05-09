@@ -274,8 +274,9 @@ SvgaCache.preload(urls);          // returns Promise<void>
 SvgaCache.has(url);               // boolean - is the .svga on disk?
 SvgaCache.path(url);              // string | null - local cache path
 await SvgaCache.size();           // number - total bytes on disk
-SvgaCache.setLimit(50 * 1024 * 1024); // bytes; oldest files evicted first
-SvgaCache.clear();                // wipes both disk and in-memory caches
+SvgaCache.setLimit(50 * 1024 * 1024);       // disk bytes; oldest evicted first
+SvgaCache.setMemoryLimit(16 * 1024 * 1024); // in-memory decoded entity bytes
+SvgaCache.clear();                          // wipes both disk and in-memory caches
 ```
 
 The disk cache lives under the platform cache directory (`Context.cacheDir/svga_cache` on Android, `Caches/svga_cache` on iOS). Files are SHA-256-keyed by URL, so the same source string maps to the same file across app launches and across devices.
@@ -374,10 +375,13 @@ interface SvgaPlayerHandle {
 
 ## Performance
 
-- Decoded `.svga` entities are kept in an LRU keyed by source string. The default limit is 32 MB.
+- Decoded `.svga` entities are kept in an LRU keyed by source string. The default limit is **32 MB on regular devices, automatically reduced to 8-16 MB on devices flagged as low-RAM** (`ActivityManager.isLowRamDevice` or `memoryClass < 256`). On iOS, `NSCache` uses the same default and auto-purges under memory pressure.
+- On Android, the memory cache subscribes to `ComponentCallbacks2`. When the system reports `TRIM_MEMORY_RUNNING_LOW` the cache halves itself; `TRIM_MEMORY_RUNNING_CRITICAL` (or `onLowMemory`) clears it. This keeps long sessions stable on small devices without manual intervention.
+- Per-frame transforms are pre-composed at parse time, so the draw path is just `concatenate(matrix) + draw` - no per-frame allocation.
+- Bitmaps are decoded with a 2048 px longest-side cap (`BitmapFactory.inSampleSize` on Android, `kCGImageSourceThumbnailMaxPixelSize` on iOS) so a single oversized asset can't OOM the device.
+- Concurrent loads of the same URL are coalesced into one network + parse + decode.
 - Disk cache evicts the oldest files (by mtime) when over the configured byte limit.
 - The frame loop tracks expected wake-up time and self-corrects so playback doesn't drift on a busy main thread.
-- A single `Matrix` / `CGAffineTransform` is reused per draw; nothing is allocated per frame.
 
 ## Security
 
