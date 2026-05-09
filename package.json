@@ -34,7 +34,7 @@
     "!**/.*"
   ],
   "scripts": {
-    "example": "yarn workspace react-native-svga-example",
+    "example": "npm --workspace=react-native-svga-example exec --",
     "clean": "del-cli lib",
     "prepare": "bob build",
     "nitrogen": "nitrogen",
@@ -98,7 +98,7 @@
   "workspaces": [
     "example"
   ],
-  "packageManager": "yarn@4.11.0",
+  "packageManager": "npm@11.6.4",
   "react-native-builder-bob": {
     "source": "src",
     "output": "lib",
