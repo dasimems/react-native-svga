@@ -1,4 +1,9 @@
 export { SvgaPlayer } from './SvgaPlayer';
 export { SvgaCache } from './SvgaCache';
-export type { SvgaPlayerProps } from './SvgaPlayer';
-export type { SvgaSound } from './SvgaPlayer';
+export type {
+  ScaleMode,
+  SoundPlayOn,
+  SvgaPlayerHandle,
+  SvgaPlayerProps,
+  SvgaSound,
+} from './types';

@@ -1,8 +1,23 @@
-import React, { memo, useCallback, useEffect } from 'react';
-import type { ViewStyle } from 'react-native';
+import {
+  forwardRef,
+  memo,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+} from 'react';
 import { getHostComponent } from 'react-native-nitro-modules';
-import type { SvgaMethods, SvgaProps } from './internal/Svga.nitro';
+import type { Svga, SvgaMethods, SvgaProps } from './internal/Svga.nitro';
+import {
+  loadSoundSafely,
+  playSoundsForTrigger,
+  shouldMuteBuiltInAudio,
+  unloadAllSounds,
+} from './internal/soundOrchestrator';
 import { svgaManager } from './SvgaCache';
+import type { SvgaPlayerHandle, SvgaPlayerProps } from './types';
+
 const SvgaConfig = require('../nitrogen/generated/shared/json/SvgaConfig.json');
 
 const SvgaView = getHostComponent<SvgaProps, SvgaMethods>(
@@ -10,100 +25,108 @@ const SvgaView = getHostComponent<SvgaProps, SvgaMethods>(
   () => SvgaConfig
 );
 
-export interface SvgaSound {
-  key: string;
-  url: string;
-  playOn: 'start' | 'finish';
-  volume?: number;
-}
+const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
+  (props, ref) => {
+    const {
+      source,
+      loops = 0,
+      autoPlay = true,
+      speed = 1.0,
+      muteBuiltInAudio,
+      builtInAudioVolume = 1.0,
+      sounds,
+      scaleMode = 'aspectFit',
+      style,
+      onStart,
+      onFinish,
+      onLoop,
+      onError,
+    } = props;
 
-export interface SvgaPlayerProps {
-  // Core
-  source: string;
-  loops?: number;
-  autoPlay?: boolean;
-  speed?: number;
+    const hybridRef = useRef<Svga | null>(null);
+    const effectiveMute = shouldMuteBuiltInAudio(muteBuiltInAudio, sounds);
 
-  // Built-in audio (baked into .svga bundle)
-  muteBuiltInAudio?: boolean;
-  builtInAudioVolume?: number;
+    useImperativeHandle(
+      ref,
+      (): SvgaPlayerHandle => ({
+        play: () => hybridRef.current?.play(),
+        pause: () => hybridRef.current?.pause(),
+        stop: () => hybridRef.current?.stop(),
+        seekToFrame: (f) => hybridRef.current?.seekToFrame(f),
+        seekToProgress: (p) => hybridRef.current?.seekToProgress(p),
+      }),
+      []
+    );
 
-  // Extra sounds (outside the bundle)
-  sounds?: SvgaSound[];
-
-  // Styling
-  scaleMode?: 'fill' | 'aspectFit' | 'aspectFill';
-  style?: ViewStyle;
-
-  // Events
-  onStart?: () => void;
-  onFinish?: () => void;
-  onLoop?: (count: number) => void;
-  onError?: (message: string) => void;
-}
-
-export const SvgaPlayer: React.FC<SvgaPlayerProps> = memo(
-  ({
-    source,
-    loops = 0,
-    autoPlay = true,
-    speed = 1.0,
-    muteBuiltInAudio = false,
-    builtInAudioVolume = 1.0,
-    sounds,
-    scaleMode = 'aspectFit',
-    style,
-    onStart,
-    onFinish,
-    onLoop,
-    onError,
-  }) => {
-    // Preload extra sounds when source changes
     useEffect(() => {
-      if (!sounds?.length) return;
+      if (!sounds?.length) return undefined;
+      let cancelled = false;
       const load = async () => {
         await Promise.all(
-          sounds.map((s) => svgaManager.loadSound(s.key, s.url))
+          sounds.map((s) =>
+            loadSoundSafely(svgaManager, s, () => cancelled, onError)
+          )
         );
       };
       load();
       return () => {
-        sounds.forEach((s) => svgaManager.unloadSound(s.key));
+        cancelled = true;
+        unloadAllSounds(svgaManager, sounds);
       };
-    }, [source, sounds]);
+    }, [sounds, onError]);
 
     const handleStart = useCallback(() => {
-      sounds
-        ?.filter((s) => s.playOn === 'start')
-        .forEach((s) => svgaManager.playSound(s.key, s.volume ?? 1.0));
+      playSoundsForTrigger(svgaManager, sounds, 'start');
       onStart?.();
-    }, [onStart, sounds]);
+    }, [sounds, onStart]);
 
     const handleFinish = useCallback(() => {
-      sounds
-        ?.filter((s) => s.playOn === 'finish')
-        .forEach((s) => svgaManager.playSound(s.key, s.volume ?? 1.0));
-      svgaManager.stopAllSounds();
+      playSoundsForTrigger(svgaManager, sounds, 'finish');
       onFinish?.();
-    }, [onFinish, sounds]);
+    }, [sounds, onFinish]);
+
+    const handleLoop = useCallback(
+      (count: number) => onLoop?.(count),
+      [onLoop]
+    );
+
+    const handleError = useCallback(
+      (message: string) => onError?.(message),
+      [onError]
+    );
+
+    const captureRef = useCallback((value: Svga) => {
+      hybridRef.current = value;
+    }, []);
+
+    const eventHandlers = useMemo(
+      () => ({
+        onStart: { f: handleStart },
+        onFinish: { f: handleFinish },
+        onLoop: { f: handleLoop },
+        onError: { f: handleError },
+      }),
+      [handleStart, handleFinish, handleLoop, handleError]
+    );
 
     return (
       <SvgaView
+        hybridRef={{ f: captureRef }}
         source={source}
         loops={loops}
         autoPlay={autoPlay}
         speed={speed}
-        muteBuiltInAudio={muteBuiltInAudio}
+        muteBuiltInAudio={effectiveMute}
         builtInAudioVolume={builtInAudioVolume}
         scaleMode={scaleMode}
         style={style}
-        onStart={{ f: handleStart }}
-        onFinish={{ f: handleFinish }}
-        onLoop={{ f: onLoop }}
-        onError={{ f: onError }}
+        {...eventHandlers}
       />
     );
   }
 );
 
-SvgaPlayer;
+SvgaPlayerInner.displayName = 'SvgaPlayer';
+
+export const SvgaPlayer = memo(SvgaPlayerInner);
+export type { SvgaPlayerProps, SvgaPlayerHandle, SvgaSound } from './types';
