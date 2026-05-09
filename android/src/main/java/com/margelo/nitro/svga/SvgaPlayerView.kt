@@ -1,0 +1,173 @@
+package com.margelo.nitro.svga
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.os.Handler
+import android.os.Looper
+import android.view.View
+
+internal class SvgaPlayerView(context: Context) : View(context) {
+
+  fun interface FrameListener { fun onFrame(frame: Int, isLastFrameOfLoop: Boolean) }
+  fun interface LoopListener { fun onLoop(count: Int) }
+  fun interface FinishListener { fun onFinish() }
+
+  var entity: SvgaEntity? = null
+    set(value) {
+      field = value
+      reset()
+      invalidate()
+    }
+
+  var scaleMode: ScaleMode = ScaleMode.ASPECTFIT
+    set(value) { field = value; invalidate() }
+
+  var maxLoops: Int = 0
+  var frameInterval: Long = DEFAULT_FRAME_INTERVAL
+
+  var onFrame: FrameListener? = null
+  var onLoop: LoopListener? = null
+  var onFinish: FinishListener? = null
+
+  private var currentFrame = 0
+  private var loopCount = 0
+  private var playing = false
+  private var nextFrameAt = 0L
+
+  fun isPlaying(): Boolean = playing
+
+  private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+  private val drawMatrix = Matrix()
+  private val handler = Handler(Looper.getMainLooper())
+
+  init {
+    setBackgroundColor(Color.TRANSPARENT)
+    isClickable = false
+  }
+
+  private val tick = object : Runnable {
+    override fun run() {
+      if (!playing) return
+      advance()
+      val nowMs = System.currentTimeMillis()
+      val drift = nowMs - nextFrameAt
+      val delay = (frameInterval - drift).coerceAtLeast(0L)
+      nextFrameAt = nowMs + delay
+      handler.postDelayed(this, delay)
+    }
+  }
+
+  fun start() {
+    if (playing) return
+    if (entity == null) return
+    playing = true
+    nextFrameAt = System.currentTimeMillis() + frameInterval
+    handler.postDelayed(tick, frameInterval)
+  }
+
+  fun pause() {
+    if (!playing) return
+    playing = false
+    handler.removeCallbacks(tick)
+  }
+
+  fun stop() {
+    playing = false
+    handler.removeCallbacks(tick)
+    reset()
+    invalidate()
+  }
+
+  fun seekToFrame(frame: Int) {
+    val total = entity?.movie?.frames ?: return
+    if (total <= 0) return
+    currentFrame = frame.coerceIn(0, total - 1)
+    invalidate()
+  }
+
+  fun release() {
+    handler.removeCallbacks(tick)
+    playing = false
+  }
+
+  override fun onDraw(canvas: Canvas) {
+    val e = entity ?: return
+    val movie = e.movie
+    if (movie.frames <= 0) return
+
+    val scale = ScaleCalculator.compute(
+      scaleMode,
+      width.toFloat(), height.toFloat(),
+      movie.viewBoxWidth, movie.viewBoxHeight
+    )
+
+    canvas.save()
+    canvas.translate(scale.translateX, scale.translateY)
+    canvas.scale(scale.scaleX, scale.scaleY)
+
+    for (sprite in movie.sprites) {
+      drawSprite(canvas, e, sprite)
+    }
+    canvas.restore()
+  }
+
+  override fun onDetachedFromWindow() {
+    super.onDetachedFromWindow()
+    release()
+  }
+
+  private fun drawSprite(canvas: Canvas, entity: SvgaEntity, sprite: SpriteEntity) {
+    val frames = sprite.frames
+    if (currentFrame >= frames.size) return
+    val frame = frames[currentFrame]
+    if (!frame.hasContent || frame.alpha <= 0f) return
+    val bitmap = entity.bitmaps[sprite.imageKey] ?: return
+    val bw = bitmap.width
+    val bh = bitmap.height
+    if (bw <= 0 || bh <= 0) return
+
+    paint.alpha = (frame.alpha * 255f).toInt().coerceIn(0, 255)
+
+    drawMatrix.set(frame.transform)
+    drawMatrix.preTranslate(frame.layout.left, frame.layout.top)
+    drawMatrix.preScale(frame.layout.width() / bw, frame.layout.height() / bh)
+    canvas.drawBitmap(bitmap, drawMatrix, paint)
+  }
+
+  private fun reset() {
+    currentFrame = 0
+    loopCount = 0
+  }
+
+  private fun advance() {
+    val movie = entity?.movie ?: return
+    val total = movie.frames
+    if (total <= 0) return
+
+    val nextFrame = currentFrame + 1
+    val isLast = nextFrame >= total
+    if (isLast) {
+      currentFrame = 0
+      loopCount += 1
+      onLoop?.onLoop(loopCount)
+      if (maxLoops in 1..loopCount) {
+        playing = false
+        invalidate()
+        onFinish?.onFinish()
+        return
+      }
+    } else {
+      currentFrame = nextFrame
+    }
+
+    onFrame?.onFrame(currentFrame, isLast)
+    invalidate()
+  }
+
+  companion object {
+    private const val DEFAULT_FRAME_INTERVAL = 66L
+  }
+}
