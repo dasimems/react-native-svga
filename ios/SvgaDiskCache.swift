@@ -1,0 +1,106 @@
+import Foundation
+
+internal enum SvgaDiskCache {
+
+    private static let SVGA_DIR = "svga_cache"
+    private static let SOUND_DIR = "svga_sounds"
+    private static let DEFAULT_LIMIT: Int64 = 50 * 1024 * 1024
+    private static var maxBytes: Int64 = DEFAULT_LIMIT
+    private static let queue = DispatchQueue(label: "svga.diskcache", attributes: .concurrent)
+
+    static func setMaxBytes(_ bytes: Int64) {
+        queue.async(flags: .barrier) { maxBytes = max(0, bytes) }
+    }
+
+    static func getMaxBytes() -> Int64 {
+        return queue.sync { maxBytes }
+    }
+
+    static func svgaURL(for source: String) -> URL { fileURL(in: SVGA_DIR, key: Hashing.sha256(source)) }
+    static func soundURL(for key: String) -> URL { fileURL(in: SOUND_DIR, key: Hashing.sha256(key)) }
+
+    static func isCached(_ source: String) -> Bool {
+        return FileManager.default.fileExists(atPath: svgaURL(for: source).path)
+    }
+
+    static func pathOrNil(_ source: String) -> String? {
+        let url = svgaURL(for: source)
+        if FileManager.default.fileExists(atPath: url.path) { return url.path }
+        return nil
+    }
+
+    static func saveSvga(_ source: String, data: Data) throws -> URL {
+        let url = svgaURL(for: source)
+        try writeAtomic(url, data: data)
+        evictIfNeeded(in: SVGA_DIR, limit: getMaxBytes())
+        return url
+    }
+
+    static func saveSound(_ key: String, data: Data) throws -> URL {
+        let url = soundURL(for: key)
+        try writeAtomic(url, data: data)
+        return url
+    }
+
+    static func clearSvga() throws {
+        let dir = try ensureDir(SVGA_DIR)
+        let items = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        for item in items { try? FileManager.default.removeItem(at: item) }
+    }
+
+    static func totalSvgaBytes() -> Int64 {
+        guard let dir = try? ensureDir(SVGA_DIR) else { return 0 }
+        guard let items = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        var total: Int64 = 0
+        for item in items {
+            let values = try? item.resourceValues(forKeys: [.fileSizeKey])
+            total += Int64(values?.fileSize ?? 0)
+        }
+        return total
+    }
+
+    private static func fileURL(in folder: String, key: String) -> URL {
+        let dir = (try? ensureDir(folder)) ?? FileManager.default.temporaryDirectory
+        return dir.appendingPathComponent(key)
+    }
+
+    private static func ensureDir(_ folder: String) throws -> URL {
+        let cache = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let dir = cache.appendingPathComponent(folder, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    private static func writeAtomic(_ target: URL, data: Data) throws {
+        let tmp = target.appendingPathExtension("tmp")
+        try data.write(to: tmp, options: .atomic)
+        if FileManager.default.fileExists(atPath: target.path) {
+            try? FileManager.default.removeItem(at: target)
+        }
+        try FileManager.default.moveItem(at: tmp, to: target)
+    }
+
+    private static func evictIfNeeded(in folder: String, limit: Int64) {
+        guard let dir = try? ensureDir(folder) else { return }
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
+        guard let items = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys) else { return }
+        var withMeta: [(url: URL, size: Int64, mtime: Date)] = []
+        var total: Int64 = 0
+        for item in items {
+            let values = try? item.resourceValues(forKeys: Set(keys))
+            let size = Int64(values?.fileSize ?? 0)
+            let mtime = values?.contentModificationDate ?? Date.distantPast
+            withMeta.append((item, size, mtime))
+            total += size
+        }
+        if total <= limit { return }
+        withMeta.sort { $0.mtime < $1.mtime }
+        for entry in withMeta {
+            if total <= limit { break }
+            try? FileManager.default.removeItem(at: entry.url)
+            total -= entry.size
+        }
+    }
+}
