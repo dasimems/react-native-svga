@@ -2,58 +2,43 @@ package com.margelo.nitro.svga
 
 import android.content.Context
 import android.media.AudioAttributes
-import android.media.SoundPool
+import android.media.MediaPlayer
+import android.media.PlaybackParams
+import android.os.Build
 import java.io.File
-import java.util.concurrent.ConcurrentHashMap
 
 internal class SvgaAudioEngine(private val context: Context) {
 
   private data class Track(
-    val soundId: Int,
+    val player: MediaPlayer,
     val startFrame: Int,
     val endFrame: Int,
     val tempFile: File
   )
 
-  private val pool: SoundPool = SoundPool.Builder()
-    .setMaxStreams(MAX_STREAMS)
-    .setAudioAttributes(
-      AudioAttributes.Builder()
-        .setUsage(AudioAttributes.USAGE_MEDIA)
-        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-        .build()
-    )
-    .build()
-
-  private val ready = ConcurrentHashMap<Int, Boolean>()
   private val tracks = mutableListOf<Track>()
-  private val activeStreams = mutableMapOf<Int, Int>()
 
   @Volatile private var muted = false
   @Volatile private var volume = 1f
   @Volatile private var rate = 1f
 
-  init {
-    pool.setOnLoadCompleteListener { _, sampleId, status ->
-      ready[sampleId] = (status == 0)
-    }
-  }
-
   fun setMuted(value: Boolean) {
     muted = value
     if (!value) return
-    for ((_, streamId) in activeStreams) pool.stop(streamId)
-    activeStreams.clear()
+    for (track in tracks) {
+      if (track.player.isPlaying) track.player.pause()
+    }
   }
 
   fun setVolume(value: Float) {
     volume = value.coerceIn(0f, 1f)
-    for ((_, streamId) in activeStreams) pool.setVolume(streamId, volume, volume)
+    for (track in tracks) track.player.setVolume(volume, volume)
   }
 
   fun setRate(value: Float) {
     rate = value.coerceIn(MIN_RATE, MAX_RATE)
-    for ((_, streamId) in activeStreams) pool.setRate(streamId, rate)
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+    for (track in tracks) applyRate(track.player)
   }
 
   fun load(entity: SvgaEntity) {
@@ -62,9 +47,13 @@ internal class SvgaAudioEngine(private val context: Context) {
     for (audio in entity.movie.audios) {
       val bytes = entity.audioData[audio.audioKey] ?: continue
       val file = File.createTempFile("svga-audio-${audio.audioKey}-", ".bin", context.cacheDir)
-      file.writeBytes(bytes)
-      val soundId = pool.load(file.absolutePath, 1)
-      tracks.add(Track(soundId, audio.startFrame, audio.endFrame, file))
+      try {
+        file.writeBytes(bytes)
+        val player = newPlayer(file) ?: continue
+        tracks.add(Track(player, audio.startFrame, audio.endFrame, file))
+      } catch (_: Exception) {
+        file.delete()
+      }
     }
   }
 
@@ -76,46 +65,93 @@ internal class SvgaAudioEngine(private val context: Context) {
     }
   }
 
-  fun pauseAll() { pool.autoPause() }
+  fun pauseAll() {
+    for (track in tracks) {
+      if (track.player.isPlaying) track.player.pause()
+    }
+  }
 
   fun resumeAll() {
     if (muted) return
-    pool.autoResume()
+    for (track in tracks) {
+      val player = track.player
+      if (!player.isPlaying && player.currentPosition > 0) {
+        try { player.start() } catch (_: IllegalStateException) {}
+      }
+    }
   }
 
   fun stopAll() {
-    for ((_, streamId) in activeStreams) pool.stop(streamId)
-    activeStreams.clear()
+    for (track in tracks) stopTrack(track)
   }
 
   fun release() {
     stopAll()
     unload()
-    pool.release()
   }
 
   private fun unload() {
     for (track in tracks) {
-      pool.unload(track.soundId)
+      try { track.player.reset() } catch (_: Exception) {}
+      track.player.release()
       track.tempFile.delete()
     }
     tracks.clear()
-    ready.clear()
+  }
+
+  private fun newPlayer(file: File): MediaPlayer? {
+    val player = MediaPlayer()
+    player.setAudioAttributes(
+      AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_MEDIA)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+        .build()
+    )
+    return try {
+      player.setDataSource(file.absolutePath)
+      player.prepare()
+      player.setVolume(volume, volume)
+      applyRate(player)
+      player
+    } catch (_: Exception) {
+      player.release()
+      null
+    }
   }
 
   private fun startTrack(track: Track) {
-    if (ready[track.soundId] != true) return
-    val streamId = pool.play(track.soundId, volume, volume, 1, 0, rate)
-    if (streamId != 0) activeStreams[track.startFrame] = streamId
+    val player = track.player
+    try {
+      player.seekTo(0)
+      applyRate(player)
+      player.start()
+    } catch (_: IllegalStateException) {}
   }
 
   private fun stopTrack(track: Track) {
-    val streamId = activeStreams.remove(track.startFrame) ?: return
-    pool.stop(streamId)
+    val player = track.player
+    try {
+      if (player.isPlaying) player.pause()
+      player.seekTo(0)
+    } catch (_: IllegalStateException) {}
+  }
+
+  private fun applyRate(player: MediaPlayer) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+    try {
+      val wasPlaying = player.isPlaying
+      val params = PlaybackParams().setSpeed(rate)
+      player.playbackParams = params
+      if (!wasPlaying) {
+        // setPlaybackParams forces playback to start on some devices; pause again.
+        try { if (player.isPlaying) player.pause() } catch (_: IllegalStateException) {}
+      }
+    } catch (_: Exception) {
+      // Some codecs don't support rate changes; ignore.
+    }
   }
 
   companion object {
-    private const val MAX_STREAMS = 4
     private const val MIN_RATE = 0.5f
     private const val MAX_RATE = 2.0f
   }

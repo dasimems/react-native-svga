@@ -8,10 +8,12 @@ A fast, secure SVGA player for React Native, built on [Nitro Modules](https://ni
 
 ## Features
 
+- **Plays every common SVGA packaging** - v2 zip (`PK…`), zlib stream (`78 xx`), gzip stream (`1F 8B`), or raw protobuf
 - **Stream from anywhere** - remote URLs, local files (`file://`), or bundled assets (`asset://`)
 - **Two-tier cache** - SHA-256-keyed disk cache + in-memory LRU of decoded entities, so the second play of a recent file is instant
-- **Built-in + external audio** - plays `.svga`-bundled audio tracks; can layer external MP3s that play on `start`/`finish`. External MP3s auto-mute the built-in audio when present (override available)
-- **Doesn't fight other audio modules** - uses an isolated `SoundPool` (Android) and per-track `AVAudioPlayer` instances (iOS) without touching `AVAudioSession`
+- **Built-in + external audio** - plays `.svga`-bundled audio tracks; can layer external sounds that play on `start`/`finish`. Externals auto-mute the built-in audio when present (override available)
+- **Broad audio format support** - Android plays MP3 / AAC / M4A / OGG / WAV / FLAC / AMR via `MediaPlayer`; iOS plays MP3 / AAC / M4A / WAV / AIFF / ALAC via `AVAudioPlayer`
+- **Doesn't fight other audio modules** - uses isolated `MediaPlayer` instances (Android) and per-track `AVAudioPlayer` instances (iOS) without touching `AVAudioSession`
 - **Programmatic controls** - `play`, `pause`, `stop`, `seekToFrame`, `seekToProgress` via a ref
 - **Lifecycle events** - `onStart`, `onLoop`, `onFinish`, `onError`
 - **Transparent background** - no card-coloured rectangle; restyle freely
@@ -358,7 +360,7 @@ interface SvgaPlayerHandle {
 ### Android
 
 - Renders into a custom `View` via `Canvas` + `drawBitmap`, transparent by default
-- Uses `SoundPool` with `USAGE_MEDIA` so it doesn't request audio focus
+- Uses `MediaPlayer` (per track) with `USAGE_MEDIA` so it doesn't request audio focus; broad codec coverage
 - Network requests use `HttpURLConnection` with explicit 15s connect / 30s read timeouts
 - Bundle and per-entry size limits guard against malicious zips (64 MB bundle / 32 MB entry)
 
