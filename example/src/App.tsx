@@ -192,7 +192,7 @@ const ExternalAudioScenario = () => {
         sounds={sounds}
         loops={1}
         style={styles.player}
-        onStart={() => setEvent('started — external mp3 playing')}
+        onStart={() => setEvent('started - external mp3 playing')}
         onFinish={() => setEvent('finished')}
         onError={(m) => setEvent(`error: ${m}`)}
       />

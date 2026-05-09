@@ -68,7 +68,7 @@ internal object SvgaSourceLoader {
     conn.instanceFollowRedirects = true
     conn.requestMethod = "GET"
     if (conn is HttpsURLConnection) {
-      // default trust manager + hostname verifier — explicit assignment for clarity
+      // default trust manager + hostname verifier - explicit assignment for clarity
       conn.hostnameVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
     }
     try {

@@ -6,14 +6,14 @@ A fast, secure SVGA player for React Native, built on [Nitro Modules](https://ni
 
 ## Features
 
-- **Stream from anywhere** — remote URLs, local files (`file://`), or bundled assets (`asset://`)
-- **Two-tier cache** — SHA-256-keyed disk cache + in-memory LRU of decoded entities, so the second play of a recent file is instant
-- **Built-in + external audio** — plays `.svga`-bundled audio tracks; can layer external MP3s that play on `start`/`finish`. External MP3s auto-mute the built-in audio when present (override available)
-- **Doesn't fight other audio modules** — uses an isolated `SoundPool` (Android) and per-track `AVAudioPlayer` instances (iOS) without touching `AVAudioSession`
-- **Programmatic controls** — `play`, `pause`, `stop`, `seekToFrame`, `seekToProgress` via a ref
-- **Lifecycle events** — `onStart`, `onLoop`, `onFinish`, `onError`
-- **Transparent background** — no card-coloured rectangle; restyle freely
-- **Hardened parser** — bounded varints, size caps, zip-slip rejection, scheme allow-list
+- **Stream from anywhere** - remote URLs, local files (`file://`), or bundled assets (`asset://`)
+- **Two-tier cache** - SHA-256-keyed disk cache + in-memory LRU of decoded entities, so the second play of a recent file is instant
+- **Built-in + external audio** - plays `.svga`-bundled audio tracks; can layer external MP3s that play on `start`/`finish`. External MP3s auto-mute the built-in audio when present (override available)
+- **Doesn't fight other audio modules** - uses an isolated `SoundPool` (Android) and per-track `AVAudioPlayer` instances (iOS) without touching `AVAudioSession`
+- **Programmatic controls** - `play`, `pause`, `stop`, `seekToFrame`, `seekToProgress` via a ref
+- **Lifecycle events** - `onStart`, `onLoop`, `onFinish`, `onError`
+- **Transparent background** - no card-coloured rectangle; restyle freely
+- **Hardened parser** - bounded varints, size caps, zip-slip rejection, scheme allow-list
 - **Drift-corrected frame loop** with no per-frame allocation
 - **TypeScript first**
 
@@ -74,19 +74,19 @@ Schemes other than `http`, `https`, `file`, and `asset` are rejected for safety,
 
 | Prop | Type | Default | Description |
 | --- | --- | --- | --- |
-| `source` | `string` | — | URL, file path, or bundled asset |
+| `source` | `string` | - | URL, file path, or bundled asset |
 | `loops` | `number` | `0` | Number of loops; `0` = infinite |
 | `autoPlay` | `boolean` | `true` | Play immediately once loaded |
-| `speed` | `number` | `1.0` | Playback speed multiplier (0.05–reasonable) |
+| `speed` | `number` | `1.0` | Playback speed multiplier (0.05-reasonable) |
 | `muteBuiltInAudio` | `boolean` | auto | If omitted, becomes `true` when `sounds` is non-empty |
-| `builtInAudioVolume` | `number` | `1.0` | 0–1 |
-| `sounds` | `SvgaSound[]` | — | Extra MP3s to play alongside the animation |
+| `builtInAudioVolume` | `number` | `1.0` | 0-1 |
+| `sounds` | `SvgaSound[]` | - | Extra MP3s to play alongside the animation |
 | `scaleMode` | `'fill' \| 'aspectFit' \| 'aspectFill'` | `'aspectFit'` | How the content fits the view |
-| `style` | `ViewStyle` | — | Standard RN view style |
-| `onStart` | `() => void` | — | Fires when playback transitions from idle to playing |
-| `onLoop` | `(count: number) => void` | — | Fires at the end of each loop |
-| `onFinish` | `() => void` | — | Fires when `loops` is reached |
-| `onError` | `(message: string) => void` | — | Fires on load / parse / network errors |
+| `style` | `ViewStyle` | - | Standard RN view style |
+| `onStart` | `() => void` | - | Fires when playback transitions from idle to playing |
+| `onLoop` | `(count: number) => void` | - | Fires at the end of each loop |
+| `onFinish` | `() => void` | - | Fires when `loops` is reached |
+| `onError` | `(message: string) => void` | - | Fires on load / parse / network errors |
 
 ### Imperative handle
 
@@ -133,8 +133,8 @@ await SvgaCache.preload([
 ]);
 
 SvgaCache.has(url);             // boolean
-SvgaCache.path(url);            // string | null — local path of the cached file
-await SvgaCache.size();         // number — total bytes on disk
+SvgaCache.path(url);            // string | null - local path of the cached file
+await SvgaCache.size();         // number - total bytes on disk
 SvgaCache.setLimit(50 * 1024 * 1024);  // bytes; oldest evicted first
 SvgaCache.clear();              // wipes both disk and in-memory caches
 ```
@@ -154,7 +154,7 @@ The disk cache lives under the platform cache directory (`Context.cacheDir/svga_
 
 - Renders into a `UIView` driven by `CADisplayLink` (weak proxy, no retain cycle)
 - Audio uses `AVAudioPlayer` instances and deliberately does not configure `AVAudioSession`, so the host app's session category is preserved
-- ZIP decompression uses Apple's `Compression` framework (raw DEFLATE) — no third-party dependency
+- ZIP decompression uses Apple's `Compression` framework (raw DEFLATE) - no third-party dependency
 - `URLSession` requests use 15s/60s timeouts
 
 ## Performance
