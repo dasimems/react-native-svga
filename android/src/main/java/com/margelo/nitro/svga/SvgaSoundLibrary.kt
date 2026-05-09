@@ -5,29 +5,38 @@ import android.media.AudioAttributes
 import android.media.MediaPlayer
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 internal class SvgaSoundLibrary(private val context: Context) {
 
-  private data class Track(val player: MediaPlayer, val file: File)
+  private class Track(val player: MediaPlayer, var refCount: Int)
 
   private val tracks = ConcurrentHashMap<String, Track>()
+  private val loadLock = ReentrantLock()
 
   fun load(key: String, source: File) {
-    if (tracks.containsKey(key)) return
-    val player = MediaPlayer()
-    player.setAudioAttributes(
-      AudioAttributes.Builder()
-        .setUsage(AudioAttributes.USAGE_MEDIA)
-        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-        .build()
-    )
-    try {
-      player.setDataSource(source.absolutePath)
-      player.prepare()
-      tracks[key] = Track(player, source)
-    } catch (e: Exception) {
-      player.release()
-      throw e
+    loadLock.withLock {
+      val existing = tracks[key]
+      if (existing != null) {
+        existing.refCount += 1
+        return
+      }
+      val player = MediaPlayer()
+      player.setAudioAttributes(
+        AudioAttributes.Builder()
+          .setUsage(AudioAttributes.USAGE_MEDIA)
+          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+          .build()
+      )
+      try {
+        player.setDataSource(source.absolutePath)
+        player.prepare()
+        tracks[key] = Track(player, 1)
+      } catch (e: Exception) {
+        player.release()
+        throw e
+      }
     }
   }
 
@@ -62,16 +71,23 @@ internal class SvgaSoundLibrary(private val context: Context) {
   }
 
   fun unload(key: String) {
-    val track = tracks.remove(key) ?: return
-    try { track.player.reset() } catch (_: Exception) {}
-    track.player.release()
-  }
-
-  fun release() {
-    for ((_, track) in tracks) {
+    loadLock.withLock {
+      val track = tracks[key] ?: return
+      track.refCount -= 1
+      if (track.refCount > 0) return
+      tracks.remove(key)
       try { track.player.reset() } catch (_: Exception) {}
       track.player.release()
     }
-    tracks.clear()
+  }
+
+  fun release() {
+    loadLock.withLock {
+      for ((_, track) in tracks) {
+        try { track.player.reset() } catch (_: Exception) {}
+        track.player.release()
+      }
+      tracks.clear()
+    }
   }
 }

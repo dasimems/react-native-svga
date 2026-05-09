@@ -19,19 +19,29 @@ internal object UrlValidator {
     if (scheme == "http" || scheme == "https") {
       val host = uri.host
       if (host.isNullOrBlank()) return null
+      val path = uri.path
+      if (path != null && pathContainsTraversal(path)) return null
       return Resolved(Kind.REMOTE, trimmed)
     }
-    if (scheme == "asset") return Resolved(Kind.BUNDLED_ASSET, trimmed.removePrefix("asset://"))
+    if (scheme == "asset") {
+      val name = trimmed.removePrefix("asset://")
+      if (pathContainsTraversal(name)) return null
+      return Resolved(Kind.BUNDLED_ASSET, name)
+    }
     if (scheme == "file") {
       val path = uri.path ?: return null
-      if (path.contains("..")) return null
+      if (pathContainsTraversal(path)) return null
       return Resolved(Kind.LOCAL_FILE, path)
     }
     if (scheme == null && trimmed.startsWith("/")) {
-      if (trimmed.contains("..")) return null
+      if (pathContainsTraversal(trimmed)) return null
       return Resolved(Kind.LOCAL_FILE, trimmed)
     }
     return null
+  }
+
+  private fun pathContainsTraversal(path: String): Boolean {
+    return path.split('/').any { it == ".." }
   }
 
   private fun parse(value: String): URI? {

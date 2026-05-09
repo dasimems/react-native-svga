@@ -31,8 +31,8 @@ internal enum SvgaDiskCache {
 
     static func saveSvga(_ source: String, data: Data) throws -> URL {
         let url = svgaURL(for: source)
+        evictToMakeRoom(in: SVGA_DIR, limit: getMaxBytes(), incoming: Int64(data.count), replacing: url)
         try writeAtomic(url, data: data)
-        evictIfNeeded(in: SVGA_DIR, limit: getMaxBytes())
         return url
     }
 
@@ -82,23 +82,30 @@ internal enum SvgaDiskCache {
         try FileManager.default.moveItem(at: tmp, to: target)
     }
 
-    private static func evictIfNeeded(in folder: String, limit: Int64) {
+    private static func evictToMakeRoom(in folder: String, limit: Int64, incoming: Int64, replacing: URL) {
         guard let dir = try? ensureDir(folder) else { return }
         let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
         guard let items = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys) else { return }
         var withMeta: [(url: URL, size: Int64, mtime: Date)] = []
         var total: Int64 = 0
+        var replacingBytes: Int64 = 0
         for item in items {
             let values = try? item.resourceValues(forKeys: Set(keys))
             let size = Int64(values?.fileSize ?? 0)
             let mtime = values?.contentModificationDate ?? Date.distantPast
+            if item.path == replacing.path {
+                replacingBytes = size
+                continue
+            }
             withMeta.append((item, size, mtime))
             total += size
         }
-        if total <= limit { return }
+        let target = limit - incoming
+        if total <= target { return }
+        _ = replacingBytes
         withMeta.sort { $0.mtime < $1.mtime }
         for entry in withMeta {
-            if total <= limit { break }
+            if total <= target { break }
             try? FileManager.default.removeItem(at: entry.url)
             total -= entry.size
         }

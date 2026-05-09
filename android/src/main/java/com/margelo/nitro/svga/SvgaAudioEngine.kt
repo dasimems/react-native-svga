@@ -10,15 +10,20 @@ import java.io.File
 
 internal class SvgaAudioEngine(private val context: Context) {
 
-  private data class Track(
+  private class Track(
     val player: MediaPlayer,
     val startFrame: Int,
     val endFrame: Int,
     val tempFile: File?,
-    val source: BytesMediaDataSource?
+    val source: BytesMediaDataSource?,
+    var prepared: Boolean,
+    var pendingStart: Boolean
   )
 
+  fun interface AudioErrorListener { fun onAudioError(message: String) }
+
   private val tracks = mutableListOf<Track>()
+  var onAudioError: AudioErrorListener? = null
 
   @Volatile private var muted = false
   @Volatile private var volume = 1f
@@ -34,13 +39,17 @@ internal class SvgaAudioEngine(private val context: Context) {
 
   fun setVolume(value: Float) {
     volume = value.coerceIn(0f, 1f)
-    for (track in tracks) track.player.setVolume(volume, volume)
+    for (track in tracks) {
+      if (track.prepared) track.player.setVolume(volume, volume)
+    }
   }
 
   fun setRate(value: Float) {
     rate = value.coerceIn(MIN_RATE, MAX_RATE)
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
-    for (track in tracks) applyRate(track.player)
+    for (track in tracks) {
+      if (track.prepared) applyRate(track.player)
+    }
   }
 
   fun load(entity: SvgaEntity) {
@@ -63,7 +72,7 @@ internal class SvgaAudioEngine(private val context: Context) {
 
   fun pauseAll() {
     for (track in tracks) {
-      if (track.player.isPlaying) track.player.pause()
+      if (track.prepared && track.player.isPlaying) track.player.pause()
     }
   }
 
@@ -71,6 +80,7 @@ internal class SvgaAudioEngine(private val context: Context) {
     if (muted) return
     for (track in tracks) {
       val player = track.player
+      if (!track.prepared) continue
       if (!player.isPlaying && player.currentPosition > 0) {
         try { player.start() } catch (_: IllegalStateException) {}
       }
@@ -108,7 +118,7 @@ internal class SvgaAudioEngine(private val context: Context) {
     var dataSource: BytesMediaDataSource? = null
     var tempFile: File? = null
 
-    return try {
+    try {
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
         dataSource = BytesMediaDataSource(bytes)
         player.setDataSource(dataSource)
@@ -117,19 +127,49 @@ internal class SvgaAudioEngine(private val context: Context) {
         tempFile.writeBytes(bytes)
         player.setDataSource(tempFile.absolutePath)
       }
-      player.prepare()
-      player.setVolume(volume, volume)
-      applyRate(player)
-      Track(player, audio.startFrame, audio.endFrame, tempFile, dataSource)
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+      onAudioError?.onAudioError("audio source setup failed for ${audio.audioKey}: ${e.message}")
       try { player.release() } catch (_: Exception) {}
       dataSource?.close()
       tempFile?.delete()
-      null
+      return null
     }
+
+    val track = Track(player, audio.startFrame, audio.endFrame, tempFile, dataSource, prepared = false, pendingStart = false)
+    player.setOnPreparedListener {
+      track.prepared = true
+      try {
+        player.setVolume(volume, volume)
+        applyRate(player)
+        if (track.pendingStart && !muted) {
+          track.pendingStart = false
+          player.seekTo(0)
+          player.start()
+        }
+      } catch (_: IllegalStateException) {}
+    }
+    player.setOnErrorListener { _, what, extra ->
+      onAudioError?.onAudioError("audio playback error for ${audio.audioKey} (what=$what extra=$extra)")
+      track.prepared = false
+      true
+    }
+    try {
+      player.prepareAsync()
+    } catch (e: Exception) {
+      onAudioError?.onAudioError("audio prepare failed for ${audio.audioKey}: ${e.message}")
+      try { player.release() } catch (_: Exception) {}
+      dataSource?.close()
+      tempFile?.delete()
+      return null
+    }
+    return track
   }
 
   private fun startTrack(track: Track) {
+    if (!track.prepared) {
+      track.pendingStart = true
+      return
+    }
     val player = track.player
     try {
       player.seekTo(0)
@@ -139,6 +179,8 @@ internal class SvgaAudioEngine(private val context: Context) {
   }
 
   private fun stopTrack(track: Track) {
+    track.pendingStart = false
+    if (!track.prepared) return
     val player = track.player
     try {
       if (player.isPlaying) player.pause()
@@ -149,12 +191,8 @@ internal class SvgaAudioEngine(private val context: Context) {
   private fun applyRate(player: MediaPlayer) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
     try {
-      val wasPlaying = player.isPlaying
       val params = PlaybackParams().setSpeed(rate)
       player.playbackParams = params
-      if (!wasPlaying) {
-        try { if (player.isPlaying) player.pause() } catch (_: IllegalStateException) {}
-      }
     } catch (_: Exception) {
     }
   }

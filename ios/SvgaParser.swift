@@ -252,7 +252,7 @@ internal enum SvgaParser {
             let tag = try r.readTag()
             switch tag.field {
             case 1: imageKey = try r.readString()
-            case 2: frames.append(try parseFrame(try r.readBytes()))
+            case 2: frames.append(try parseFrame(try r.readSubReader()))
             default: try r.skip(wire: tag.wire)
             }
         }

@@ -4,18 +4,22 @@ import androidx.annotation.Keep
 import com.facebook.proguard.annotations.DoNotStrip
 import com.margelo.nitro.NitroModules
 import com.margelo.nitro.core.Promise
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 @DoNotStrip
 @Keep
 class HybridSvgaManager : HybridSvgaManagerSpec() {
 
   private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+  private val preloadGate = Semaphore(MAX_CONCURRENT_PRELOADS)
   private val context get() = NitroModules.applicationContext
     ?: throw IllegalStateException("Application context unavailable")
   private val sounds = SvgaSoundLibrary(context)
@@ -25,7 +29,7 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
   override fun preload(urls: Array<String>): Promise<Unit> {
     return Promise.async(scope) {
       urls.map { source ->
-        async { preloadOne(source) }
+        async { preloadGate.withPermit { preloadOne(source) } }
       }.awaitAll()
       Unit
     }
@@ -35,7 +39,15 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
     return Promise.async(scope) {
       urls.map { source ->
         async {
-          try { SvgaSourceLoader.loadEntity(context, source) } catch (_: Throwable) {}
+          preloadGate.withPermit {
+            try {
+              SvgaSourceLoader.loadEntity(context, source)
+            } catch (e: CancellationException) {
+              throw e
+            } catch (_: Throwable) {
+              // best-effort warmup; failures are reported per-play via onError
+            }
+          }
         }
       }.awaitAll()
       Unit
@@ -95,5 +107,9 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
     val resolved = UrlValidator.resolve(source) ?: return
     if (resolved.kind != UrlValidator.Kind.REMOTE) return
     SvgaSourceLoader.preloadRemote(context, resolved.value)
+  }
+
+  companion object {
+    private const val MAX_CONCURRENT_PRELOADS = 4
   }
 }

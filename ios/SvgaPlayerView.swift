@@ -60,6 +60,16 @@ internal final class SvgaPlayerView: UIView {
             setNeedsDisplay()
         }
         let link = CADisplayLink(target: WeakProxy(self), selector: #selector(WeakProxy.tick))
+        let targetFps = max(1, Int(round(1.0 / max(frameInterval, 0.001))))
+        if #available(iOS 15.0, *) {
+            link.preferredFrameRateRange = CAFrameRateRange(
+                minimum: Float(min(30, targetFps)),
+                maximum: Float(targetFps),
+                preferred: Float(targetFps)
+            )
+        } else {
+            link.preferredFramesPerSecond = targetFps
+        }
         link.add(to: .main, forMode: .common)
         displayLink = link
     }

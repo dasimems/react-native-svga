@@ -23,9 +23,9 @@ internal object SvgaDiskCache {
 
   fun saveSvga(ctx: Context, url: String, bytes: ByteArray): File {
     val file = svgaFile(ctx, url)
+    evictToMakeRoom(svgaDir(ctx), maxBytes.get(), bytes.size.toLong(), file)
     writeAtomic(file, bytes)
     touch(file)
-    evict(svgaDir(ctx), maxBytes.get())
     return file
   }
 
@@ -65,13 +65,16 @@ internal object SvgaDiskCache {
 
   private fun touch(file: File) { file.setLastModified(System.currentTimeMillis()) }
 
-  private fun evict(dir: File, limit: Long) {
+  private fun evictToMakeRoom(dir: File, limit: Long, incoming: Long, replacing: File) {
     val files = dir.listFiles()?.toMutableList() ?: return
-    var total = files.sumOf { it.length() }
-    if (total <= limit) return
+    val existingReplacement = files.firstOrNull { it.absolutePath == replacing.absolutePath }
+    val replacingBytes = existingReplacement?.length() ?: 0L
+    var total = files.sumOf { it.length() } - replacingBytes
+    if (total + incoming <= limit) return
     files.sortBy { it.lastModified() }
     for (f in files) {
-      if (total <= limit) break
+      if (total + incoming <= limit) break
+      if (f.absolutePath == replacing.absolutePath) continue
       total -= f.length()
       f.delete()
     }

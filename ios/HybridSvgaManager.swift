@@ -3,8 +3,8 @@ import NitroModules
 
 final class HybridSvgaManager: HybridSvgaManagerSpec {
 
+    private static let MAX_CONCURRENT_PRELOADS = 4
     private let sounds = SvgaSoundLibrary()
-    private let queue = DispatchQueue(label: "svga.manager", qos: .utility, attributes: .concurrent)
 
     func preload(urls: [String]) throws -> Promise<Void> {
         return Promise.async { [weak self] in
@@ -14,16 +14,26 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
     }
 
     func preloadDecoded(urls: [String]) throws -> Promise<Void> {
+        let limit = Self.MAX_CONCURRENT_PRELOADS
         return Promise.async {
             await withTaskGroup(of: Void.self) { group in
-                for source in urls {
+                var inFlight = 0
+                var iterator = urls.makeIterator()
+                func enqueueNext() {
+                    guard let source = iterator.next() else { return }
+                    inFlight += 1
                     group.addTask {
                         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                             SvgaSourceLoader.loadEntity(source) { _ in cont.resume(returning: ()) }
                         }
                     }
                 }
-                for await _ in group { }
+                for _ in 0..<min(limit, urls.count) { enqueueNext() }
+                while inFlight > 0 {
+                    _ = await group.next()
+                    inFlight -= 1
+                    enqueueNext()
+                }
             }
         }
     }
@@ -78,11 +88,21 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
     deinit { sounds.release() }
 
     private func preloadAll(_ urls: [String]) async throws {
+        let limit = Self.MAX_CONCURRENT_PRELOADS
         try await withThrowingTaskGroup(of: Void.self) { group in
-            for source in urls {
+            var iterator = urls.makeIterator()
+            var inFlight = 0
+            func enqueue() throws {
+                guard let source = iterator.next() else { return }
+                inFlight += 1
                 group.addTask { try await self.preloadOne(source) }
             }
-            for try await _ in group { }
+            for _ in 0..<min(limit, urls.count) { try enqueue() }
+            while inFlight > 0 {
+                try await group.next()
+                inFlight -= 1
+                try enqueue()
+            }
         }
     }
 

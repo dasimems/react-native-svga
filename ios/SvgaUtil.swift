@@ -23,30 +23,44 @@ internal enum UrlValidator {
     static func resolve(_ source: String) -> ResolvedSource? {
         let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return nil }
-        if trimmed.contains("..") { return nil }
 
         guard let components = URLComponents(string: trimmed) else {
-            if trimmed.hasPrefix("/") { return ResolvedSource(kind: .localFile, value: trimmed) }
+            if trimmed.hasPrefix("/") {
+                if pathContainsTraversal(trimmed) { return nil }
+                return ResolvedSource(kind: .localFile, value: trimmed)
+            }
             return nil
         }
         let scheme = components.scheme?.lowercased()
 
         if scheme == "http" || scheme == "https" {
             guard let host = components.host, !host.isEmpty else { return nil }
+            if pathContainsTraversal(components.path) { return nil }
             return ResolvedSource(kind: .remote, value: trimmed)
         }
         if scheme == "asset" {
             let name = trimmed.replacingOccurrences(of: "asset://", with: "")
+            if pathContainsTraversal(name) { return nil }
             return ResolvedSource(kind: .bundledAsset, value: name)
         }
         if scheme == "file" {
             guard let path = components.path.removingPercentEncoding else { return nil }
+            if pathContainsTraversal(path) { return nil }
             return ResolvedSource(kind: .localFile, value: path)
         }
         if scheme == nil && trimmed.hasPrefix("/") {
+            if pathContainsTraversal(trimmed) { return nil }
             return ResolvedSource(kind: .localFile, value: trimmed)
         }
         return nil
+    }
+
+    private static func pathContainsTraversal(_ path: String) -> Bool {
+        // Reject only path-segment '..', not arbitrary substrings like 'foo..bar'.
+        for segment in path.split(separator: "/", omittingEmptySubsequences: true) {
+            if segment == ".." { return true }
+        }
+        return false
     }
 }
 

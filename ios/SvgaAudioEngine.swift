@@ -3,10 +3,13 @@ import Foundation
 
 internal final class SvgaAudioEngine {
 
+    typealias AudioErrorHandler = (String) -> Void
+
     private final class Track {
         let player: AVAudioPlayer
         let startFrame: Int
         let endFrame: Int
+        var wasPlayingBeforeInterrupt: Bool = false
         init(player: AVAudioPlayer, startFrame: Int, endFrame: Int) {
             self.player = player
             self.startFrame = startFrame
@@ -18,11 +21,25 @@ internal final class SvgaAudioEngine {
     private var muted = false
     private var volume: Float = 1
     private var rate: Float = 1
+    private var interruptionObserver: NSObjectProtocol?
+    var onAudioError: AudioErrorHandler?
+
+    init() {
+        registerInterruptionObserver()
+    }
+
+    deinit {
+        if let observer = interruptionObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
 
     func setMuted(_ value: Bool) {
         muted = value
         if !value { return }
-        for track in tracks { track.player.stop() }
+        for track in tracks {
+            if track.player.isPlaying { track.player.pause() }
+        }
     }
 
     func setVolume(_ value: Float) {
@@ -55,6 +72,7 @@ internal final class SvgaAudioEngine {
                     endFrame: audio.endFrame
                 ))
             } catch {
+                onAudioError?("audio load failed for \(audio.audioKey): \(error.localizedDescription)")
                 continue
             }
         }
@@ -69,7 +87,9 @@ internal final class SvgaAudioEngine {
     }
 
     func pauseAll() {
-        for track in tracks { track.player.pause() }
+        for track in tracks {
+            if track.player.isPlaying { track.player.pause() }
+        }
     }
 
     func resumeAll() {
@@ -96,5 +116,40 @@ internal final class SvgaAudioEngine {
             track.player.stop()
         }
         tracks.removeAll()
+    }
+
+    private func registerInterruptionObserver() {
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            self?.handleInterruption(note)
+        }
+    }
+
+    private func handleInterruption(_ note: Notification) {
+        guard let typeRaw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
+        switch type {
+        case .began:
+            for track in tracks {
+                track.wasPlayingBeforeInterrupt = track.player.isPlaying
+                if track.player.isPlaying { track.player.pause() }
+            }
+        case .ended:
+            let optionsRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
+            if !options.contains(.shouldResume) { return }
+            if muted { return }
+            for track in tracks {
+                if track.wasPlayingBeforeInterrupt {
+                    track.player.play()
+                }
+                track.wasPlayingBeforeInterrupt = false
+            }
+        @unknown default:
+            return
+        }
     }
 }

@@ -72,6 +72,9 @@ final class HybridSvga: HybridSvgaSpec {
             if self.playInBackground { return }
             if visible { self.handleWindowReturned() } else { self.handleWindowGone() }
         }
+        audio.onAudioError = { [weak self] message in
+            self?.onError?(message)
+        }
     }
 
     private func handleWindowGone() {
@@ -121,6 +124,7 @@ final class HybridSvga: HybridSvgaSpec {
     func isPlaying() throws -> Bool { playerView.isPlaying }
 
     deinit {
+        if let active = activeSource { SvgaSourceLoader.cancelLoad(active) }
         playerView.release()
         audio.release()
     }
@@ -131,6 +135,8 @@ final class HybridSvga: HybridSvgaSpec {
         }
         loadToken += 1
         let token = loadToken
+        pendingPlayOnLoad = false
+        wasPlayingBeforeWindowGone = false
         if value.isEmpty {
             activeSource = nil
             entityRef = nil

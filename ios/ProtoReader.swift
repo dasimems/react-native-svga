@@ -13,26 +13,23 @@ internal final class ProtoReader {
         let wire: Int
     }
 
-    private let bytes: [UInt8]
+    private let data: Data
+    private let base: Int
     private let limit: Int
     private var pos: Int
 
     init(_ data: Data) {
-        self.bytes = [UInt8](data)
-        self.limit = self.bytes.count
-        self.pos = 0
+        self.data = data
+        self.base = data.startIndex
+        self.limit = data.endIndex
+        self.pos = data.startIndex
     }
 
-    init(_ bytes: [UInt8]) {
-        self.bytes = bytes
-        self.limit = bytes.count
-        self.pos = 0
-    }
-
-    private init(bytes: [UInt8], pos: Int, limit: Int) {
-        self.bytes = bytes
-        self.pos = pos
+    private init(data: Data, base: Int, limit: Int) {
+        self.data = data
+        self.base = base
         self.limit = limit
+        self.pos = base
     }
 
     var hasMore: Bool { pos < limit }
@@ -43,7 +40,7 @@ internal final class ProtoReader {
         var read = 0
         while pos < limit {
             if read >= 10 { throw SvgaError("varint too long") }
-            let b = UInt64(bytes[pos])
+            let b = UInt64(data[pos])
             pos += 1
             read += 1
             result |= (b & 0x7F) << shift
@@ -61,7 +58,7 @@ internal final class ProtoReader {
     func readSubReader() throws -> ProtoReader {
         let len = Int(try readVarint())
         if len < 0 || pos + len > limit { throw SvgaError("length-delimited overflow") }
-        let sub = ProtoReader(bytes: bytes, pos: pos, limit: pos + len)
+        let sub = ProtoReader(data: data, base: pos, limit: pos + len)
         pos += len
         return sub
     }
@@ -69,15 +66,15 @@ internal final class ProtoReader {
     func readBytes() throws -> Data {
         let len = Int(try readVarint())
         if len < 0 || pos + len > limit { throw SvgaError("length-delimited overflow") }
-        let slice = bytes[pos..<(pos + len)]
+        let slice = data.subdata(in: pos..<(pos + len))
         pos += len
-        return Data(slice)
+        return slice
     }
 
     func readString() throws -> String {
         let len = Int(try readVarint())
         if len < 0 || pos + len > limit { throw SvgaError("length-delimited overflow") }
-        let slice = bytes[pos..<(pos + len)]
+        let slice = data[pos..<(pos + len)]
         pos += len
         return String(decoding: slice, as: UTF8.self)
     }
@@ -86,10 +83,10 @@ internal final class ProtoReader {
 
     func readFloat() throws -> Float {
         if pos + 4 > limit { throw SvgaError("truncated float") }
-        let bits = UInt32(bytes[pos])
-            | (UInt32(bytes[pos + 1]) << 8)
-            | (UInt32(bytes[pos + 2]) << 16)
-            | (UInt32(bytes[pos + 3]) << 24)
+        let bits = UInt32(data[pos])
+            | (UInt32(data[pos + 1]) << 8)
+            | (UInt32(data[pos + 2]) << 16)
+            | (UInt32(data[pos + 3]) << 24)
         pos += 4
         return Float(bitPattern: bits)
     }

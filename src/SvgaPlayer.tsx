@@ -78,7 +78,12 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
       const load = async () => {
         await Promise.all(
           sounds.map((s) =>
-            loadSoundSafely(svgaManager, s, () => cancelled, onError)
+            loadSoundSafely(
+              svgaManager,
+              s,
+              () => cancelled,
+              (m) => onErrorRef.current?.(m)
+            )
           )
         );
       };
@@ -87,7 +92,7 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
         cancelled = true;
         unloadAllSounds(svgaManager, sounds);
       };
-    }, [sounds, onError]);
+    }, [sounds]);
 
     useEffect(() => {
       if (playInBackground) return undefined;
@@ -109,7 +114,6 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
     useEffect(() => {
       return () => {
         hybridRef.current?.stop();
-        svgaManager.stopAllSounds();
       };
     }, []);
 

@@ -27,6 +27,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   private var entity: SvgaEntity? = null
   private var pendingPlayOnLoad = false
   private var wasPlayingBeforeWindowGone = false
+  private var loadToken = 0L
 
   override val view: View = playerView
 
@@ -80,6 +81,9 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
     playerView.onWindowVisibilityChange = SvgaPlayerView.WindowVisibilityListener { visible ->
       if (playInBackground) return@WindowVisibilityListener
       if (visible) handleWindowReturned() else handleWindowGone()
+    }
+    audio.onAudioError = SvgaAudioEngine.AudioErrorListener { message ->
+      main.post { onError?.invoke(message) }
     }
   }
 
@@ -137,6 +141,10 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
 
   private fun handleSource(value: String) {
     loadJob?.cancel()
+    loadToken += 1
+    val token = loadToken
+    pendingPlayOnLoad = false
+    wasPlayingBeforeWindowGone = false
     if (value.isEmpty()) {
       entity = null
       playerView.stop()
@@ -147,9 +155,16 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
     loadJob = scope.launch {
       try {
         val parsed = SvgaSourceLoader.loadEntity(context.applicationContext, value)
-        withContext(Dispatchers.Main) { applyEntity(parsed) }
+        withContext(Dispatchers.Main) {
+          if (token != loadToken) return@withContext
+          applyEntity(parsed)
+        }
       } catch (e: Exception) {
-        main.post { onError?.invoke(e.message ?: "Failed to load svga") }
+        if (e is kotlinx.coroutines.CancellationException) return@launch
+        main.post {
+          if (token != loadToken) return@post
+          onError?.invoke(e.message ?: "Failed to load svga")
+        }
       }
     }
   }
