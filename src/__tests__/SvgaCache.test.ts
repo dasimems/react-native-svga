@@ -1,3 +1,5 @@
+import type { SvgaCache as SvgaCacheType } from '../SvgaCache';
+
 type MockSvgaManager = {
   preload: jest.Mock;
   isCached: jest.Mock;
@@ -36,7 +38,7 @@ jest.mock('react-native-nitro-modules', () => ({
 }));
 
 describe('SvgaCache', () => {
-  let SvgaCache: typeof import('../SvgaCache').SvgaCache;
+  let SvgaCache: typeof SvgaCacheType;
 
   beforeEach(() => {
     jest.resetModules();
