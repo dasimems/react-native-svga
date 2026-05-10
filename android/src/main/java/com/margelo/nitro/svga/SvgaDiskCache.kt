@@ -78,10 +78,21 @@ internal object SvgaDiskCache {
 
   private fun writeAtomic(target: File, bytes: ByteArray) {
     val tmp = File(target.parentFile, target.name + ".tmp")
-    tmp.writeBytes(bytes)
-    if (!tmp.renameTo(target)) {
-      target.writeBytes(bytes)
+    try {
+      tmp.writeBytes(bytes)
+      if (tmp.renameTo(target)) return
+      // Atomic rename failed (cross-volume? destination locked?). The
+      // previous fallback wrote directly to `target` non-atomically, so a
+      // crash mid-write would leave a partial file that subsequent reads
+      // would silently load and crash on. Fail closed instead and surface
+      // the failure to the caller so we don't poison the cache with a
+      // truncated entry.
       tmp.delete()
+      target.delete()
+      throw java.io.IOException("atomic rename failed for ${target.absolutePath}")
+    } catch (t: Throwable) {
+      tmp.delete()
+      throw t
     }
   }
 

@@ -37,7 +37,12 @@ internal struct SpriteEntity {
 internal final class FrameEntity {
     let alpha: CGFloat
     let layout: CGRect
-    var transform: CGAffineTransform
+    /// Composed transform = layout-translate × bitmap-scale × frame-transform.
+    /// Immutable after parse: the parser sets this exactly once via
+    /// `applyComposedTransform`, before the entity is published to the cache
+    /// or the player view. Treating it as `var` previously left the door open
+    /// for double-composition on cache-shared entities.
+    private(set) var transform: CGAffineTransform
     let hasContent: Bool
 
     init(alpha: CGFloat, layout: CGRect, transform: CGAffineTransform, hasContent: Bool) {
@@ -45,6 +50,13 @@ internal final class FrameEntity {
         self.layout = layout
         self.transform = transform
         self.hasContent = hasContent
+    }
+
+    /// Parser-only entry point for finalising the composed transform. Must
+    /// be called at most once per FrameEntity and only before the entity is
+    /// shared (i.e. before `SvgaMemoryCache.put` or `playerView.entity =`).
+    func applyComposedTransform(_ t: CGAffineTransform) {
+        transform = t
     }
 }
 

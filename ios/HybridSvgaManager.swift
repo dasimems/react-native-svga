@@ -7,8 +7,13 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
     private let sounds = SvgaSoundLibrary()
 
     func preload(urls: [String]) throws -> Promise<Void> {
-        return Promise.async { [weak self] in
-            guard let self = self else { return }
+        // The manager is owned by Nitro for the JS context's lifetime; if we
+        // captured `self` weakly and Nitro reclaimed the manager mid-preload,
+        // the promise would resolve with `()` instead of failing — JS-side
+        // `await SvgaCache.preload(urls)` would then return a false success.
+        // Capture strongly and rely on `cancel()` in `dispose()` to break
+        // outstanding work cleanly.
+        return Promise.async {
             try await self.preloadAll(urls)
         }
     }
@@ -16,24 +21,39 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
     func preloadDecoded(urls: [String]) throws -> Promise<Void> {
         let limit = Self.MAX_CONCURRENT_PRELOADS
         return Promise.async {
-            await withTaskGroup(of: Void.self) { group in
+            // Collect the first error and propagate it once the group drains
+            // (so a single bad URL surfaces up to JS as a real failure
+            // instead of silently swallowing every result). Other URLs are
+            // best-effort and don't get re-thrown.
+            try await withThrowingTaskGroup(of: Result<Void, Error>.self) { group in
                 var inFlight = 0
                 var iterator = urls.makeIterator()
                 func enqueueNext() {
                     guard let source = iterator.next() else { return }
                     inFlight += 1
                     group.addTask {
-                        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                            SvgaSourceLoader.loadEntity(source) { _ in cont.resume(returning: ()) }
+                        await withCheckedContinuation { (cont: CheckedContinuation<Result<Void, Error>, Never>) in
+                            SvgaSourceLoader.loadEntity(source) { result in
+                                switch result {
+                                case .success: cont.resume(returning: .success(()))
+                                case .failure(let err): cont.resume(returning: .failure(err))
+                                }
+                            }
                         }
                     }
                 }
                 for _ in 0..<min(limit, urls.count) { enqueueNext() }
+                var firstError: Error?
                 while inFlight > 0 {
-                    _ = await group.next()
+                    if let result = try await group.next() {
+                        if case .failure(let err) = result, firstError == nil {
+                            firstError = err
+                        }
+                    }
                     inFlight -= 1
                     enqueueNext()
                 }
+                if let firstError = firstError { throw firstError }
             }
         }
     }
@@ -87,8 +107,7 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
     }
 
     func loadSound(key: String, url: String) throws -> Promise<Void> {
-        return Promise.async { [weak self] in
-            guard let self = self else { return }
+        return Promise.async {
             let url = try await self.fetchSoundFile(key: key, url: url)
             try self.sounds.load(key: key, url: url)
         }

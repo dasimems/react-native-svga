@@ -69,6 +69,12 @@ internal final class SvgaPlayerView: UIView {
             onFrame?(currentFrame, false)
             setNeedsDisplay()
         }
+        // Defensive: if a previous start() left a link attached (e.g. an
+        // entity swap that didn't go through pause()), invalidate it before
+        // overwriting the property — otherwise the old link stays on the
+        // run loop forever ticking against this view.
+        displayLink?.invalidate()
+        displayLink = nil
         let link = CADisplayLink(target: WeakProxy(self), selector: #selector(WeakProxy.tick))
         let targetFps = max(1, Int(round(1.0 / max(frameInterval, 0.001))))
         if #available(iOS 15.0, *) {

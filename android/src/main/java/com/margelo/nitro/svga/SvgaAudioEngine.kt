@@ -19,7 +19,11 @@ import java.io.File
  *    (HybridSvga calls them from main, applyEntity is on main).
  *  - `MediaPlayer.OnPreparedListener` and `OnErrorListener` callbacks fire
  *    on a non-main "media" thread. Track state mutated from those callbacks
- *    (`prepared`, `pendingStart`) is `@Volatile` to publish updates safely.
+ *    (`prepared`, `pendingStart`, `released`) is `@Volatile` to publish
+ *    updates safely. All `tracks`-list access (the list itself, not its
+ *    elements' fields) is wrapped in `synchronized(tracksLock)` because the
+ *    OnPreparedListener can mutate-adjacent state while `unload`/`load` is
+ *    iterating; we snapshot before iterating where possible.
  *  - The audio-error listener is dispatched to main via `mainHandler.post`
  *    so consumers always receive errors on a known thread.
  *
@@ -32,7 +36,7 @@ import java.io.File
  *    `stopTrack` at `endFrame`.
  *  - `pendingStart` is set when a frame matches `startFrame` while a track is
  *    still preparing. The OnPreparedListener consumes the flag and starts
- *    the track only if `!muted && !paused`.
+ *    the track only if `!muted && !paused && !released`.
  */
 internal class SvgaAudioEngine(private val context: Context) {
 
@@ -45,11 +49,17 @@ internal class SvgaAudioEngine(private val context: Context) {
   ) {
     @Volatile var prepared: Boolean = false
     @Volatile var pendingStart: Boolean = false
+    /// Set by `unload()` before `player.release()`. Every code path that
+    /// touches `player` must check this first — `MediaPlayer.setVolume` /
+    /// `start` / `seekTo` on a released player throws IllegalStateException
+    /// (and on some OEMs raises a fatal native abort).
+    @Volatile var released: Boolean = false
   }
 
   fun interface AudioErrorListener { fun onAudioError(message: String) }
 
   private val tracks = mutableListOf<Track>()
+  private val tracksLock = Any()
   private val mainHandler = Handler(Looper.getMainLooper())
   var onAudioError: AudioErrorListener? = null
 
@@ -58,26 +68,35 @@ internal class SvgaAudioEngine(private val context: Context) {
   @Volatile private var volume = 1f
   @Volatile private var rate = 1f
 
+  private fun snapshotTracks(): List<Track> = synchronized(tracksLock) { tracks.toList() }
+
   fun setMuted(value: Boolean) {
     muted = value
     if (!value) return
-    for (track in tracks) {
-      if (track.prepared && track.player.isPlaying) track.player.pause()
+    for (track in snapshotTracks()) {
+      if (track.released || !track.prepared) continue
+      try {
+        if (track.player.isPlaying) track.player.pause()
+      } catch (_: IllegalStateException) {}
     }
   }
 
   fun setVolume(value: Float) {
     volume = value.coerceIn(0f, 1f)
-    for (track in tracks) {
-      if (track.prepared) track.player.setVolume(volume, volume)
+    for (track in snapshotTracks()) {
+      if (track.released || !track.prepared) continue
+      try {
+        track.player.setVolume(volume, volume)
+      } catch (_: IllegalStateException) {}
     }
   }
 
   fun setRate(value: Float) {
     rate = value.coerceIn(MIN_RATE, MAX_RATE)
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
-    for (track in tracks) {
-      if (track.prepared) applyRate(track.player)
+    for (track in snapshotTracks()) {
+      if (track.released || !track.prepared) continue
+      applyRate(track)
     }
   }
 
@@ -85,16 +104,22 @@ internal class SvgaAudioEngine(private val context: Context) {
     unload()
     paused = false
     if (entity.movie.audios.isEmpty()) return
+    val newTracks = ArrayList<Track>(entity.movie.audios.size)
     for (audio in entity.movie.audios) {
       val bytes = entity.audioData[audio.audioKey] ?: continue
       val track = newTrack(audio, bytes) ?: continue
-      tracks.add(track)
+      newTracks.add(track)
     }
+    synchronized(tracksLock) { tracks.addAll(newTracks) }
   }
 
   fun onFrame(frame: Int) {
     if (muted || paused) return
-    for (track in tracks) {
+    // Snapshot under the lock so a concurrent unload() doesn't tear our
+    // iteration. Tracks already in the snapshot may still flip `released`
+    // mid-iteration — startTrack/stopTrack check that explicitly.
+    for (track in snapshotTracks()) {
+      if (track.released) continue
       if (frame == track.startFrame) startTrack(track)
       if (frame == track.endFrame) stopTrack(track)
     }
@@ -102,26 +127,28 @@ internal class SvgaAudioEngine(private val context: Context) {
 
   fun pauseAll() {
     paused = true
-    for (track in tracks) {
-      if (track.prepared && track.player.isPlaying) track.player.pause()
+    for (track in snapshotTracks()) {
+      if (track.released || !track.prepared) continue
+      try {
+        if (track.player.isPlaying) track.player.pause()
+      } catch (_: IllegalStateException) {}
     }
   }
 
   fun resumeAll() {
     paused = false
     if (muted) return
-    for (track in tracks) {
-      val player = track.player
-      if (!track.prepared) continue
-      if (!player.isPlaying && player.currentPosition > 0) {
-        try { player.start() } catch (_: IllegalStateException) {}
-      }
+    for (track in snapshotTracks()) {
+      if (track.released || !track.prepared) continue
+      try {
+        if (!track.player.isPlaying && track.player.currentPosition > 0) track.player.start()
+      } catch (_: IllegalStateException) {}
     }
   }
 
   fun stopAll() {
     paused = true
-    for (track in tracks) stopTrack(track)
+    for (track in snapshotTracks()) stopTrack(track)
   }
 
   fun release() {
@@ -130,19 +157,26 @@ internal class SvgaAudioEngine(private val context: Context) {
   }
 
   private fun unload() {
-    for (track in tracks) {
-      // Clear listeners first so a still-pending OnPreparedListener
-      // doesn't fire setVolume/start on the player after we release it.
+    val toRelease: List<Track> = synchronized(tracksLock) {
+      val copy = tracks.toList()
+      tracks.clear()
+      copy
+    }
+    for (track in toRelease) {
+      // Mark released BEFORE clearing listeners + reset + release so any
+      // concurrent OnPreparedListener that fires after we null the listener
+      // still sees the flag and short-circuits.
+      track.released = true
+      track.prepared = false
       try {
         track.player.setOnPreparedListener(null)
         track.player.setOnErrorListener(null)
         track.player.reset()
       } catch (_: Exception) {}
-      track.player.release()
+      try { track.player.release() } catch (_: Exception) {}
       track.source?.close()
       track.tempFile?.delete()
     }
-    tracks.clear()
   }
 
   private fun newTrack(audio: AudioEntity, bytes: ByteArray): Track? {
@@ -176,11 +210,15 @@ internal class SvgaAudioEngine(private val context: Context) {
 
     val track = Track(player, audio.startFrame, audio.endFrame, tempFile, dataSource)
     player.setOnPreparedListener {
+      // Listener fires on the media thread. Read the released flag (volatile)
+      // before doing anything else — `unload` may have started and the
+      // player may be unsafe to touch.
+      if (track.released) return@setOnPreparedListener
       track.prepared = true
       try {
         player.setVolume(volume, volume)
-        applyRate(player)
-        if (track.pendingStart && !muted && !paused) {
+        applyRate(track)
+        if (track.pendingStart && !muted && !paused && !track.released) {
           track.pendingStart = false
           try {
             player.seekTo(0)
@@ -209,7 +247,7 @@ internal class SvgaAudioEngine(private val context: Context) {
   }
 
   private fun startTrack(track: Track) {
-    if (paused) return
+    if (paused || track.released) return
     if (!track.prepared) {
       track.pendingStart = true
       return
@@ -217,14 +255,14 @@ internal class SvgaAudioEngine(private val context: Context) {
     val player = track.player
     try {
       player.seekTo(0)
-      applyRate(player)
+      applyRate(track)
       player.start()
     } catch (_: IllegalStateException) {}
   }
 
   private fun stopTrack(track: Track) {
     track.pendingStart = false
-    if (!track.prepared) return
+    if (track.released || !track.prepared) return
     val player = track.player
     try {
       if (player.isPlaying) player.pause()
@@ -232,8 +270,10 @@ internal class SvgaAudioEngine(private val context: Context) {
     } catch (_: IllegalStateException) {}
   }
 
-  private fun applyRate(player: MediaPlayer) {
+  private fun applyRate(track: Track) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+    if (track.released) return
+    val player = track.player
     try {
       // setPlaybackParams with non-zero speed may auto-start a paused/prepared
       // player on Android API 23+, so capture state and restore it.

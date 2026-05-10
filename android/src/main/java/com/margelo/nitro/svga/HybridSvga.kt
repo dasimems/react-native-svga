@@ -29,6 +29,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   private var wasPlayingBeforeWindowGone = false
   private var userPaused = false
   private var loadToken = 0L
+  @Volatile private var disposed = false
 
   override val view: View = playerView
 
@@ -102,6 +103,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   }
 
   override fun play() {
+    if (disposed) return
     userPaused = false
     val current = entity
     if (current == null) {
@@ -115,6 +117,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   }
 
   override fun pause() {
+    if (disposed) return
     userPaused = true
     pendingPlayOnLoad = false
     wasPlayingBeforeWindowGone = false
@@ -123,6 +126,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   }
 
   override fun stop() {
+    if (disposed) return
     pendingPlayOnLoad = false
     wasPlayingBeforeWindowGone = false
     userPaused = false
@@ -130,15 +134,19 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
     audio.stopAll()
   }
 
-  override fun seekToFrame(frame: Double) { playerView.seekToFrame(frame.toInt()) }
+  override fun seekToFrame(frame: Double) {
+    if (disposed) return
+    playerView.seekToFrame(frame.toInt())
+  }
 
   override fun seekToProgress(progress: Double) {
+    if (disposed) return
     val total = entity?.movie?.frames ?: return
     val clamped = progress.coerceIn(0.0, 1.0)
     playerView.seekToFrame((clamped * total).toInt())
   }
 
-  override fun isPlaying(): Boolean = playerView.isPlaying()
+  override fun isPlaying(): Boolean = !disposed && playerView.isPlaying()
 
   // Nitro's eager-cleanup hook. JS calls this via dispose(), and we also
   // call it ourselves from SvgaPlayer.tsx unmount because the auto-generated
@@ -146,13 +154,21 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   // the view from its lookup map. Without an explicit dispose, the loadJob,
   // CoroutineScope, audio engine, and MediaPlayers leak until JVM GC.
   override fun dispose() {
+    if (disposed) return
+    disposed = true
     loadJob?.cancel()
     scope.cancel()
     playerView.release()
     audio.release()
+    // Release our +1 on the entity so its bitmaps can recycle when the
+    // last holder (cache or another player) drops too. playerView.release
+    // already cleared its own retain; this drops ours.
+    entity?.release()
+    entity = null
   }
 
   private fun handleSource(value: String) {
+    if (disposed) return
     loadJob?.cancel()
     loadToken += 1
     val token = loadToken
@@ -160,6 +176,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
     wasPlayingBeforeWindowGone = false
     userPaused = false
     if (value.isEmpty()) {
+      entity?.release()
       entity = null
       playerView.stop()
       playerView.entity = null
@@ -168,24 +185,40 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
     }
     loadJob = scope.launch {
       try {
+        // loadEntity returns +1; we own it from here. Either we transfer
+        // ownership into `applyEntity`, or release on the cancel/dispose
+        // paths so bitmaps can reach refcount zero.
         val parsed = SvgaSourceLoader.loadEntity(context.applicationContext, value)
         withContext(Dispatchers.Main) {
-          if (token != loadToken) return@withContext
+          if (token != loadToken || disposed) {
+            parsed.release()
+            return@withContext
+          }
           applyEntity(parsed)
         }
-      } catch (e: Exception) {
-        if (e is kotlinx.coroutines.CancellationException) return@launch
+      } catch (e: kotlinx.coroutines.CancellationException) {
+        return@launch
+      } catch (t: Throwable) {
+        // Catching `Throwable` (not just `Exception`) because
+        // `BitmapFactory.decodeByteArray` can raise OutOfMemoryError on a
+        // low-RAM device — that's an `Error`, escapes a `catch (Exception)`,
+        // and crashes the host process. We can't rescue every Error
+        // (StackOverflowError, etc.), but OOM during a media decode is
+        // recoverable: just surface it via onError and let the user retry.
         main.post {
-          if (token != loadToken) return@post
-          onError?.invoke(e.message ?: "Failed to load svga")
+          if (token != loadToken || disposed) return@post
+          onError?.invoke(t.message ?: "Failed to load svga")
         }
       }
     }
   }
 
+  // Caller transfers a +1 ownership of `parsed` into this method.
   private fun applyEntity(parsed: SvgaEntity) {
-    entity = parsed
-    playerView.entity = parsed
+    val prior = entity
+    entity = parsed  // consume the loader's +1
+    prior?.release()
+    playerView.entity = parsed  // setter takes its own +1
     playerView.scaleMode = scaleMode
     applySpeed()
     audio.setMuted(muteBuiltInAudio)

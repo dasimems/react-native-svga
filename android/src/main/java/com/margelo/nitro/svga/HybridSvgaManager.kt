@@ -1,5 +1,6 @@
 package com.margelo.nitro.svga
 
+import android.util.Log
 import androidx.annotation.Keep
 import com.facebook.proguard.annotations.DoNotStrip
 import com.margelo.nitro.NitroModules
@@ -12,6 +13,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 
@@ -40,16 +42,24 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
 
   override fun preloadDecoded(urls: Array<String>): Promise<Unit> {
     return Promise.async(scope) {
+      // Best-effort warmup — failures don't fail the whole batch (one bad
+      // URL shouldn't kill 100 valid preloads), but we log them so they're
+      // not silently invisible. Previously this swallowed every Throwable
+      // with no signal at all.
       coroutineScope {
         urls.map { source ->
           async {
             preloadGate.withPermit {
               try {
-                SvgaSourceLoader.loadEntity(context, source)
+                // loadEntity returns +1 ownership; we only want to warm
+                // the cache (which holds its own +1), so release ours
+                // immediately. Without this the entity bitmaps would
+                // never recycle until the JS context tore down.
+                SvgaSourceLoader.loadEntity(context, source).release()
               } catch (e: CancellationException) {
                 throw e
-              } catch (_: Throwable) {
-                // best-effort warmup; failures are reported per-play via onError
+              } catch (t: Throwable) {
+                Log.w(TAG, "preloadDecoded failed for $source: ${t.message}")
               }
             }
           }
@@ -86,9 +96,19 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
   }
 
   override fun clearCache() {
-    SvgaDiskCache.clearSvga(context)
-    SvgaDiskCache.clearSounds(context)
+    // Memory clear is cheap and synchronous so the next memory-cache read
+    // sees a miss immediately. The on-disk delete walks the cache dirs and
+    // can list+unlink hundreds of files on a busy device — offload to the
+    // IO scope so it can't ANR the JS thread.
     SvgaMemoryCache.clear()
+    scope.launch {
+      try {
+        SvgaDiskCache.clearSvga(context)
+        SvgaDiskCache.clearSounds(context)
+      } catch (t: Throwable) {
+        Log.w(TAG, "clearCache disk eviction failed: ${t.message}")
+      }
+    }
   }
 
   override fun getCacheSize(): Promise<Double> {
@@ -131,5 +151,6 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
 
   companion object {
     private const val MAX_CONCURRENT_PRELOADS = 4
+    private const val TAG = "SvgaManager"
   }
 }

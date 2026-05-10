@@ -43,24 +43,21 @@ internal class ProtoReader private constructor(
   }
 
   fun readSubReader(): ProtoReader {
-    val len = readVarint().toInt()
-    if (len < 0 || pos + len > limit) throw SvgaParseException("length-delimited overflow")
+    val len = checkedLength()
     val sub = ProtoReader(buf, pos + len, pos)
     pos += len
     return sub
   }
 
   fun readBytes(): ByteArray {
-    val len = readVarint().toInt()
-    if (len < 0 || pos + len > limit) throw SvgaParseException("length-delimited overflow")
+    val len = checkedLength()
     val data = buf.copyOfRange(pos, pos + len)
     pos += len
     return data
   }
 
   fun readString(): String {
-    val len = readVarint().toInt()
-    if (len < 0 || pos + len > limit) throw SvgaParseException("length-delimited overflow")
+    val len = checkedLength()
     val s = String(buf, pos, len, Charsets.UTF_8)
     pos += len
     return s
@@ -89,14 +86,29 @@ internal class ProtoReader private constructor(
   }
 
   private fun skipBytes() {
-    val len = readVarint().toInt()
-    if (len < 0 || pos + len > limit) throw SvgaParseException("length-delimited overflow")
+    val len = checkedLength()
     pos += len
   }
 
   private fun advance(n: Int) {
     if (pos + n > limit) throw SvgaParseException("truncated fixed field")
     pos += n
+  }
+
+  /// Read a length-delimited length and validate it lies within the reader's
+  /// window. Performed in Long arithmetic so a hostile varint near
+  /// `Int.MAX_VALUE` cannot wrap `pos + len` to a small positive number and
+  /// slip the bounds check, which would then trap with
+  /// NegativeArraySizeException / StringIndexOutOfBoundsException further on.
+  private fun checkedLength(): Int {
+    val raw = readVarint()
+    if (raw < 0 || raw > Int.MAX_VALUE.toLong()) {
+      throw SvgaParseException("length-delimited overflow")
+    }
+    val len = raw.toInt()
+    val end = pos.toLong() + len.toLong()
+    if (end > limit.toLong()) throw SvgaParseException("length-delimited overflow")
+    return len
   }
 }
 

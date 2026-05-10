@@ -56,25 +56,24 @@ internal final class ProtoReader {
     }
 
     func readSubReader() throws -> ProtoReader {
-        let len = Int(try readVarint())
-        if len < 0 || pos + len > limit { throw SvgaError("length-delimited overflow") }
+        let len = try checkedLength()
         let sub = ProtoReader(data: data, base: pos, limit: pos + len)
         pos += len
         return sub
     }
 
     func readBytes() throws -> Data {
-        let len = Int(try readVarint())
-        if len < 0 || pos + len > limit { throw SvgaError("length-delimited overflow") }
+        let len = try checkedLength()
         let slice = data.subdata(in: pos..<(pos + len))
         pos += len
         return slice
     }
 
     func readString() throws -> String {
-        let len = Int(try readVarint())
-        if len < 0 || pos + len > limit { throw SvgaError("length-delimited overflow") }
-        let slice = data[pos..<(pos + len)]
+        let len = try checkedLength()
+        // subdata copies; required because the caller may outlive `data` and
+        // a slice would retain the whole buffer.
+        let slice = data.subdata(in: pos..<(pos + len))
         pos += len
         return String(decoding: slice, as: UTF8.self)
     }
@@ -102,13 +101,27 @@ internal final class ProtoReader {
     }
 
     private func skipBytes() throws {
-        let len = Int(try readVarint())
-        if len < 0 || pos + len > limit { throw SvgaError("length-delimited overflow") }
+        let len = try checkedLength()
         pos += len
     }
 
     private func advance(_ n: Int) throws {
         if pos + n > limit { throw SvgaError("truncated fixed field") }
         pos += n
+    }
+
+    /// Reads a length-delimited length and validates it lies within the
+    /// reader's window. Performed in Int64 space so a hostile varint near
+    /// `Int.max` cannot wrap `pos + len` to a small positive number and slip
+    /// the bounds check.
+    private func checkedLength() throws -> Int {
+        let raw = try readVarint()
+        if raw > UInt64(Int.max) { throw SvgaError("length-delimited overflow") }
+        let len = Int(raw)
+        let end = Int64(pos) + Int64(len)
+        if len < 0 || end > Int64(limit) {
+            throw SvgaError("length-delimited overflow")
+        }
+        return len
     }
 }

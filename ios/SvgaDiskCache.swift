@@ -56,6 +56,11 @@ internal enum SvgaDiskCache {
     static func saveSvga(_ source: String, data: Data) throws -> URL {
         let url = svgaURL(for: source)
         var thrown: Error?
+        // Synchronous so callers receive a usable URL only after the bytes
+        // are committed. Note: the *caller* (SvgaSourceLoader.preloadRemote
+        // and saveSoundFile) provides its own dispatch — the URLSession
+        // completion-queue users in `loadData` have been routed to
+        // `saveSvgaAsync` so this `.sync` doesn't pin that queue.
         writeQueue.sync {
             do {
                 evictToMakeRoom(in: SVGA_DIR, limit: getMaxBytes(), incoming: Int64(data.count), replacing: url)
@@ -66,6 +71,22 @@ internal enum SvgaDiskCache {
         }
         if let thrown = thrown { throw thrown }
         return url
+    }
+
+    /// Fire-and-forget write used from queues we don't want to block (e.g.
+    /// the URLSession completion queue). Errors are silently dropped — the
+    /// download succeeded so the user-facing entity is delivered; cache
+    /// failure only means the next load won't be a cache hit.
+    static func saveSvgaAsync(_ source: String, data: Data) {
+        let url = svgaURL(for: source)
+        writeQueue.async {
+            do {
+                evictToMakeRoom(in: SVGA_DIR, limit: getMaxBytes(), incoming: Int64(data.count), replacing: url)
+                try writeAtomic(url, data: data)
+            } catch {
+                // intentional: best-effort cache write
+            }
+        }
     }
 
     static func saveSound(_ key: String, data: Data) throws -> URL {

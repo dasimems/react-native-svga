@@ -44,11 +44,15 @@ internal object SvgaMemoryCache {
     }
   }
 
-  fun get(key: String): SvgaEntity? = cache[key]
+  /// Returns a hit retained on behalf of the caller (+1). The caller is
+  /// responsible for `release()`-ing when done. See `SvgaEntity` for the
+  /// ownership convention.
+  fun get(key: String): SvgaEntity? = cache[key]?.retain()
 
   fun put(key: String, entity: SvgaEntity) {
     if (cache.maxSize() <= 0) return
-    cache.put(key, entity)
+    // Cache holds its own +1; `entryRemoved` releases on eviction/replace.
+    cache.put(key, entity.retain())
   }
 
   fun clear() { cache.evictAll() }
@@ -74,6 +78,19 @@ internal object SvgaMemoryCache {
       override fun sizeOf(key: String, value: SvgaEntity): Int {
         val raw = value.byteSize + ENTRY_HEADROOM
         return raw.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+      }
+
+      // Released here covers every removal path: explicit put-replace,
+      // LRU eviction, evictAll (clear/setMaxBytes), and trimToSize
+      // (memory-pressure trims). When the last live holder also releases,
+      // the entity recycles its bitmaps.
+      override fun entryRemoved(
+        evicted: Boolean,
+        key: String,
+        oldValue: SvgaEntity,
+        newValue: SvgaEntity?
+      ) {
+        oldValue.release()
       }
     }
   }

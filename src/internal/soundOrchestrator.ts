@@ -31,11 +31,13 @@ export const namespaceSounds = (
 export const playSoundsForTrigger = (
   manager: SoundManagerLike,
   sounds: NamespacedSound[] | undefined,
-  trigger: SvgaSound['playOn']
+  trigger: SvgaSound['playOn'],
+  isLoaded?: (sound: NamespacedSound) => boolean
 ): void => {
   if (!sounds?.length) return;
   for (const sound of sounds) {
     if (sound.playOn !== trigger) continue;
+    if (isLoaded && !isLoaded(sound)) continue;
     const volume = sound.volume ?? 1.0;
     manager.playSound(sound.key, volume);
   }

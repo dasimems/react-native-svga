@@ -22,12 +22,32 @@ import {
 import { svgaManager } from './SvgaCache';
 import type { SvgaPlayerHandle, SvgaPlayerProps } from './types';
 
-const SvgaConfig = require('../nitrogen/generated/shared/json/SvgaConfig.json');
+// Lazy host-component init. require + getHostComponent at module-scope throws
+// synchronously when nitrogen output is missing/stale or the native module
+// isn't linked, which escapes `import` and white-screens the app. Defer it so
+// the throw becomes a normal React render error caught by an error boundary.
+type SvgaHostComponent = ReturnType<
+  typeof getHostComponent<SvgaProps, SvgaMethods>
+>;
+let cachedSvgaView: SvgaHostComponent | null = null;
+const getSvgaView = (): SvgaHostComponent => {
+  if (cachedSvgaView) return cachedSvgaView;
+  const SvgaConfig = require('../nitrogen/generated/shared/json/SvgaConfig.json');
+  cachedSvgaView = getHostComponent<SvgaProps, SvgaMethods>(
+    'Svga',
+    () => SvgaConfig
+  );
+  return cachedSvgaView;
+};
 
-const SvgaView = getHostComponent<SvgaProps, SvgaMethods>(
-  'Svga',
-  () => SvgaConfig
-);
+const noopHandle = (): void => {
+  if (__DEV__) {
+    console.warn(
+      '[SvgaPlayer] Method called on a disposed (unmounted) player; ignoring. ' +
+        'Capture imperative handles only while the component is mounted.'
+    );
+  }
+};
 
 const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
   (props, ref) => {
@@ -48,7 +68,10 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
       onError,
     } = props;
 
+    const SvgaView = useMemo(getSvgaView, []);
+
     const hybridRef = useRef<Svga | null>(null);
+    const disposedRef = useRef(false);
     const instanceId = useId();
     const effectiveMute = useMemo(
       () => shouldMuteBuiltInAudio(muteBuiltInAudio, sounds),
@@ -82,15 +105,36 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
     const onErrorRef = useRef(onError);
     onErrorRef.current = onError;
 
+    // Exposes `play()`/`pause()`/etc. to the parent via ref. Each method
+    // short-circuits to a dev-warn no-op once the player is disposed so
+    // late callers don't crash on a freed native handle.
     useImperativeHandle(
       ref,
       (): SvgaPlayerHandle => ({
-        play: () => hybridRef.current?.play(),
-        pause: () => hybridRef.current?.pause(),
-        stop: () => hybridRef.current?.stop(),
-        seekToFrame: (f) => hybridRef.current?.seekToFrame(f),
-        seekToProgress: (p) => hybridRef.current?.seekToProgress(p),
-        isPlaying: () => hybridRef.current?.isPlaying() ?? false,
+        play: () => {
+          if (disposedRef.current) return noopHandle();
+          hybridRef.current?.play();
+        },
+        pause: () => {
+          if (disposedRef.current) return noopHandle();
+          hybridRef.current?.pause();
+        },
+        stop: () => {
+          if (disposedRef.current) return noopHandle();
+          hybridRef.current?.stop();
+        },
+        seekToFrame: (f) => {
+          if (disposedRef.current) return noopHandle();
+          hybridRef.current?.seekToFrame(f);
+        },
+        seekToProgress: (p) => {
+          if (disposedRef.current) return noopHandle();
+          hybridRef.current?.seekToProgress(p);
+        },
+        isPlaying: () => {
+          if (disposedRef.current) return false;
+          return hybridRef.current?.isPlaying() ?? false;
+        },
       }),
       []
     );
@@ -145,24 +189,34 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
               // swallow — we're starting fresh
             }
           }
-          await loadSoundSafely(
-            svgaManager,
-            s,
-            () => !mountedRef.current,
-            (m) => onErrorRef.current?.(m)
-          );
-          if (!mountedRef.current) {
-            // Unmounted during our load. The unmount-only cleanup already
-            // drained `loaded`, so we own this entry — unload it.
-            svgaManager.unloadSound(s.key);
-            return;
+          try {
+            await loadSoundSafely(
+              svgaManager,
+              s,
+              () => !mountedRef.current,
+              (m) => {
+                if (!mountedRef.current) return;
+                onErrorRef.current?.(m);
+              }
+            );
+            if (!mountedRef.current) {
+              // Unmounted during our load. The unmount-only cleanup already
+              // drained `loaded`, so we own this entry — unload it.
+              svgaManager.unloadSound(s.key);
+              return;
+            }
+            // If a newer load for this key has been queued (chains[key] is
+            // a different Promise), it will run after us and write the
+            // canonical entry. Don't touch `loaded` — we're stale.
+            if (chains.get(s.key) !== myPromise) return;
+            loaded.set(s.key, s.url);
+          } finally {
+            // Only clear our own chain entry. Without the identity check a
+            // late-arriving deletion would clear a newer queued load and
+            // strand it without a serializer — leaking the chain map and
+            // reordering loads.
+            if (chains.get(s.key) === myPromise) chains.delete(s.key);
           }
-          // If a newer load for this key has been queued (chains[key] is
-          // a different Promise), it will run after us and write the
-          // canonical entry. Don't touch `loaded` — we're stale.
-          if (chains.get(s.key) !== myPromise) return;
-          chains.delete(s.key);
-          loaded.set(s.key, s.url);
         };
         myPromise = run();
         chains.set(s.key, myPromise);
@@ -199,6 +253,10 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
         return undefined;
       }
       const onChange = (state: AppStateStatus) => {
+        // Late events can fire after the player has been disposed by the
+        // unmount effect below — skip them so we don't poke a freed
+        // native handle.
+        if (disposedRef.current) return;
         if (state === 'active') {
           if (!wasPlayingForBgRef.current) return;
           wasPlayingForBgRef.current = false;
@@ -221,6 +279,11 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
     useEffect(() => {
       return () => {
         const hybrid = hybridRef.current;
+        // Mark disposed FIRST so any AppState event, imperative handle
+        // call, or in-flight callback that fires before native dispose
+        // returns sees the gate and short-circuits.
+        disposedRef.current = true;
+        hybridRef.current = null;
         if (!hybrid) return;
         try {
           hybrid.stop();
@@ -231,29 +294,61 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
         // ViewManager doesn't call dispose() on view drop, so without
         // this the audio engine, coroutine scope, and MediaPlayers
         // leak until JVM GC.
-        hybrid.dispose?.();
+        try {
+          hybrid.dispose?.();
+        } catch {
+          // ignore — best-effort cleanup
+        }
       };
     }, []);
 
-    const handleStart = useCallback(() => {
-      playSoundsForTrigger(svgaManager, namespacedSoundsRef.current, 'start');
-      onStartRef.current?.();
+    // Tracks the source we've handed to native. Used to filter onStart/
+    // onFinish callbacks and gate sound triggers when a load is still
+    // in flight, so audio from the old source can't fire over frames of
+    // the new one.
+    const activeSourceRef = useRef(source);
+    useEffect(() => {
+      activeSourceRef.current = source;
+    }, [source]);
+
+    const isSoundLoaded = useCallback((s: NamespacedSound) => {
+      return loadedSoundsRef.current.get(s.key) === s.url;
     }, []);
+
+    const handleStart = useCallback(() => {
+      if (disposedRef.current) return;
+      playSoundsForTrigger(
+        svgaManager,
+        namespacedSoundsRef.current,
+        'start',
+        isSoundLoaded
+      );
+      onStartRef.current?.();
+    }, [isSoundLoaded]);
 
     const handleFinish = useCallback(() => {
-      playSoundsForTrigger(svgaManager, namespacedSoundsRef.current, 'finish');
+      if (disposedRef.current) return;
+      playSoundsForTrigger(
+        svgaManager,
+        namespacedSoundsRef.current,
+        'finish',
+        isSoundLoaded
+      );
       onFinishRef.current?.();
-    }, []);
+    }, [isSoundLoaded]);
 
     const handleLoop = useCallback((count: number) => {
+      if (disposedRef.current) return;
       onLoopRef.current?.(count);
     }, []);
 
     const handleError = useCallback((message: string) => {
+      if (disposedRef.current) return;
       onErrorRef.current?.(message);
     }, []);
 
     const captureRef = useCallback((value: Svga) => {
+      if (disposedRef.current) return;
       hybridRef.current = value;
     }, []);
 

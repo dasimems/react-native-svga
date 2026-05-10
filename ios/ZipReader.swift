@@ -16,10 +16,16 @@ internal enum ZipReader {
 
     static func entries(from data: Data) throws -> [ZipEntry] {
         let eocd = try findEocd(data)
-        let cdSize = Int(read32(data, eocd.offset + 12))
-        let cdOffset = Int(read32(data, eocd.offset + 16))
-        if cdOffset < 0 || cdOffset + cdSize > data.count { throw SvgaError("corrupt central directory") }
+        let cdSize = Int(try read32(data, eocd.offset + 12))
+        let cdOffset = Int(try read32(data, eocd.offset + 16))
         if cdSize < 0 { throw SvgaError("corrupt central directory") }
+        // Use Int64 to detect overflow when cdOffset+cdSize wraps past Int.max
+        // on hostile input. data.count is bounded by the file size (≤ 64 MB
+        // upstream), so a wrap implies a malicious EOCD.
+        let cdEnd64 = Int64(cdOffset) + Int64(cdSize)
+        if cdOffset < 0 || cdEnd64 > Int64(data.count) {
+            throw SvgaError("corrupt central directory")
+        }
 
         var results: [ZipEntry] = []
         var totalBytes = 0
@@ -28,25 +34,32 @@ internal enum ZipReader {
 
         while p < cdEnd {
             if p + 46 > cdEnd { throw SvgaError("corrupt central directory header") }
-            let sig = read32(data, p)
+            let sig = try read32(data, p)
             if sig != CDH_SIGNATURE { break }
-            let method = read16(data, p + 10)
-            let compressedSize = Int(read32(data, p + 20))
-            let uncompressedSize = Int(read32(data, p + 24))
-            let nameLen = Int(read16(data, p + 28))
-            let extraLen = Int(read16(data, p + 30))
-            let commentLen = Int(read16(data, p + 32))
-            let localOffset = Int(read32(data, p + 42))
+            let method = try read16(data, p + 10)
+            let compressedSize = Int(try read32(data, p + 20))
+            let uncompressedSize = Int(try read32(data, p + 24))
+            let nameLen = Int(try read16(data, p + 28))
+            let extraLen = Int(try read16(data, p + 30))
+            let commentLen = Int(try read16(data, p + 32))
+            let localOffset = Int(try read32(data, p + 42))
 
             if compressedSize < 0 || uncompressedSize < 0 { throw SvgaError("negative size") }
             if uncompressedSize > MAX_ENTRY_BYTES { throw SvgaError("zip entry exceeds size limit") }
 
             let nameStart = p + 46
-            if nameStart + nameLen > cdEnd { throw SvgaError("entry name overflow") }
+            let nameEnd64 = Int64(nameStart) + Int64(nameLen)
+            if nameLen < 0 || nameEnd64 > Int64(cdEnd) {
+                throw SvgaError("entry name overflow")
+            }
             guard let name = String(data: data.subdata(in: nameStart..<(nameStart + nameLen)), encoding: .utf8) else {
                 throw SvgaError("entry name not utf8")
             }
-            p = nameStart + nameLen + extraLen + commentLen
+            let nextP64 = Int64(nameStart) + Int64(nameLen) + Int64(extraLen) + Int64(commentLen)
+            if extraLen < 0 || commentLen < 0 || nextP64 > Int64(cdEnd) {
+                throw SvgaError("zip header field overflow")
+            }
+            p = Int(nextP64)
 
             if !isSafeName(name) { continue }
             if name.hasSuffix("/") { continue }
@@ -70,7 +83,10 @@ internal enum ZipReader {
         var i = n - minSize
         let lower = max(0, n - maxScan)
         while i >= lower {
-            if read32(data, i) == EOCD_SIGNATURE { return Eocd(offset: i) }
+            // Tolerate a malformed prefix near the start of the scan window
+            // (read32 throws if i < 0 or i+4 > data.count) — those positions
+            // are simply not the EOCD.
+            if (try? read32(data, i)) == EOCD_SIGNATURE { return Eocd(offset: i) }
             i -= 1
         }
         throw SvgaError("end-of-central-directory not found")
@@ -78,12 +94,17 @@ internal enum ZipReader {
 
     private static func readLocal(_ data: Data, at offset: Int, method: UInt16, compressedSize: Int, uncompressedSize: Int) throws -> Data {
         if offset < 0 || offset + 30 > data.count { throw SvgaError("local header out of range") }
-        let sig = read32(data, offset)
+        let sig = try read32(data, offset)
         if sig != LFH_SIGNATURE { throw SvgaError("invalid local header") }
-        let nameLen = Int(read16(data, offset + 26))
-        let extraLen = Int(read16(data, offset + 28))
-        let dataStart = offset + 30 + nameLen + extraLen
-        if dataStart + compressedSize > data.count { throw SvgaError("entry data out of range") }
+        let nameLen = Int(try read16(data, offset + 26))
+        let extraLen = Int(try read16(data, offset + 28))
+        if nameLen < 0 || extraLen < 0 { throw SvgaError("invalid local header field") }
+        let dataStart64 = Int64(offset) + 30 + Int64(nameLen) + Int64(extraLen)
+        let dataEnd64 = dataStart64 + Int64(compressedSize)
+        if dataEnd64 > Int64(data.count) || dataStart64 < 0 {
+            throw SvgaError("entry data out of range")
+        }
+        let dataStart = Int(dataStart64)
 
         let raw = data.subdata(in: dataStart..<(dataStart + compressedSize))
         if method == 0 { return raw }
@@ -108,16 +129,29 @@ internal enum ZipReader {
         return dst
     }
 
-    private static func read32(_ data: Data, _ offset: Int) -> UInt32 {
-        let b0 = UInt32(data[offset])
-        let b1 = UInt32(data[offset + 1]) << 8
-        let b2 = UInt32(data[offset + 2]) << 16
-        let b3 = UInt32(data[offset + 3]) << 24
+    // Read helpers validate against `data.count` so callers don't need to
+    // pre-check every offset. They also normalise to the slice's startIndex,
+    // because Data subscripts are absolute and a slice can have a non-zero
+    // startIndex — passing such a slice through `data[offset]` with a
+    // caller-relative offset would silently read the wrong bytes (or trap).
+    private static func read32(_ data: Data, _ offset: Int) throws -> UInt32 {
+        if offset < 0 || offset + 4 > data.count {
+            throw SvgaError("zip read out of range")
+        }
+        let base = data.startIndex
+        let b0 = UInt32(data[base + offset])
+        let b1 = UInt32(data[base + offset + 1]) << 8
+        let b2 = UInt32(data[base + offset + 2]) << 16
+        let b3 = UInt32(data[base + offset + 3]) << 24
         return b0 | b1 | b2 | b3
     }
 
-    private static func read16(_ data: Data, _ offset: Int) -> UInt16 {
-        return UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
+    private static func read16(_ data: Data, _ offset: Int) throws -> UInt16 {
+        if offset < 0 || offset + 2 > data.count {
+            throw SvgaError("zip read out of range")
+        }
+        let base = data.startIndex
+        return UInt16(data[base + offset]) | (UInt16(data[base + offset + 1]) << 8)
     }
 
     private static func isSafeName(_ name: String) -> Bool {

@@ -13,43 +13,72 @@ final class HybridSvga: HybridSvgaSpec {
     private var activeLoadId: SvgaSourceLoader.LoadCallbackId = 0
     private var wasPlayingBeforeWindowGone = false
     private var userPaused = false
+    private var disposed = false
     private let defaultFps = 15
     private let minSpeed: Double = 0.05
 
     var view: UIView { playerView }
 
+    /// Run `work` on the main queue. Nitro can dispatch property setters and
+    /// methods from any thread (the JS thread, in particular). UIKit access
+    /// off-main asserts on iOS 16+, and the player view + audio engine both
+    /// expect main-thread invariants — so we hop here once at every public
+    /// entry point. If we're already on main, run synchronously to keep
+    /// ordering with prior calls.
+    private func runOnMain(_ work: @escaping () -> Void) {
+        if disposed { return }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
+    }
+
     var source: String = "" {
         didSet {
             if source == oldValue { return }
-            handleSource(source)
+            let value = source
+            runOnMain { [weak self] in self?.handleSource(value) }
         }
     }
 
     var loops: Double = 0 {
-        didSet { playerView.maxLoops = max(0, Int(loops)) }
+        didSet {
+            let value = loops
+            runOnMain { [weak self] in self?.playerView.maxLoops = max(0, Int(value)) }
+        }
     }
 
     var autoPlay: Bool = true
 
     var speed: Double = 1 {
         didSet {
-            applySpeed()
-            audio.setRate(Float(speed))
+            let value = speed
+            runOnMain { [weak self] in
+                guard let self = self else { return }
+                self.applySpeed()
+                self.audio.setRate(Float(value))
+            }
         }
     }
 
     var muteBuiltInAudio: Bool = false {
-        didSet { audio.setMuted(muteBuiltInAudio) }
+        didSet {
+            let value = muteBuiltInAudio
+            runOnMain { [weak self] in self?.audio.setMuted(value) }
+        }
     }
 
     var builtInAudioVolume: Double = 1 {
-        didSet { audio.setVolume(Float(builtInAudioVolume)) }
+        didSet {
+            let value = builtInAudioVolume
+            runOnMain { [weak self] in self?.audio.setVolume(Float(value)) }
+        }
     }
 
     var playInBackground: Bool = false
 
     var scaleMode: ScaleMode = .aspectfit {
-        didSet { playerView.scaleMode = scaleMode }
+        didSet {
+            let value = scaleMode
+            runOnMain { [weak self] in self?.playerView.scaleMode = value }
+        }
     }
 
     var onStart: (() -> Void)?
@@ -93,56 +122,80 @@ final class HybridSvga: HybridSvgaSpec {
     }
 
     func play() throws {
-        userPaused = false
-        if entityRef == nil {
-            pendingPlayOnLoad = true
-            return
+        runOnMain { [weak self] in
+            guard let self = self else { return }
+            self.userPaused = false
+            if self.entityRef == nil {
+                self.pendingPlayOnLoad = true
+                return
+            }
+            let wasIdle = !self.playerView.isPlaying
+            self.playerView.start()
+            self.audio.resumeAll()
+            if wasIdle { self.onStart?() }
         }
-        let wasIdle = !playerView.isPlaying
-        playerView.start()
-        audio.resumeAll()
-        if wasIdle { onStart?() }
     }
 
     func pause() throws {
-        userPaused = true
-        pendingPlayOnLoad = false
-        wasPlayingBeforeWindowGone = false
-        playerView.pause()
-        audio.pauseAll()
+        runOnMain { [weak self] in
+            guard let self = self else { return }
+            self.userPaused = true
+            self.pendingPlayOnLoad = false
+            self.wasPlayingBeforeWindowGone = false
+            self.playerView.pause()
+            self.audio.pauseAll()
+        }
     }
 
     func stop() throws {
-        pendingPlayOnLoad = false
-        wasPlayingBeforeWindowGone = false
-        userPaused = false
-        playerView.stop()
-        audio.stopAll()
+        runOnMain { [weak self] in
+            guard let self = self else { return }
+            self.pendingPlayOnLoad = false
+            self.wasPlayingBeforeWindowGone = false
+            self.userPaused = false
+            self.playerView.stop()
+            self.audio.stopAll()
+        }
     }
 
     func seekToFrame(frame: Double) throws {
-        playerView.seekToFrame(Int(frame))
+        runOnMain { [weak self] in self?.playerView.seekToFrame(Int(frame)) }
     }
 
     func seekToProgress(progress: Double) throws {
-        guard let total = entityRef?.movie.frames else { return }
-        let clamped = max(0, min(1, progress))
-        playerView.seekToFrame(Int(clamped * Double(total)))
+        runOnMain { [weak self] in
+            guard let self = self else { return }
+            guard let total = self.entityRef?.movie.frames else { return }
+            let clamped = max(0, min(1, progress))
+            self.playerView.seekToFrame(Int(clamped * Double(total)))
+        }
     }
 
-    func isPlaying() throws -> Bool { playerView.isPlaying }
+    func isPlaying() throws -> Bool {
+        // Synchronous return is required by the spec. UIView property reads
+        // from off-main are tolerated by AppKit/UIKit for trivial-getter
+        // properties (Bool/Int) and the alternative is blocking the JS
+        // thread on a dispatch — accept the read race.
+        if disposed { return false }
+        return playerView.isPlaying
+    }
 
     func dispose() {
         // JS-side eager cleanup. SvgaPlayer.tsx unmount calls this so we
         // don't wait for JS GC to reclaim the handle. Idempotent — also
         // safe to call from deinit if dispose was never invoked.
-        if let active = activeSource, activeLoadId != 0 {
-            SvgaSourceLoader.cancelLoad(active, callbackId: activeLoadId)
-            activeLoadId = 0
+        if disposed { return }
+        disposed = true
+        let cleanup = { [self] in
+            if let active = self.activeSource, self.activeLoadId != 0 {
+                SvgaSourceLoader.cancelLoad(active, callbackId: self.activeLoadId)
+                self.activeLoadId = 0
+            }
+            self.activeSource = nil
+            self.playerView.release()
+            self.audio.release()
         }
-        activeSource = nil
-        playerView.release()
-        audio.release()
+        if Thread.isMainThread { cleanup() } else { DispatchQueue.main.sync(execute: cleanup) }
     }
 
     deinit {

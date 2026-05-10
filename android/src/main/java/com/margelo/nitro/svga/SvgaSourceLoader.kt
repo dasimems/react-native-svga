@@ -35,18 +35,24 @@ internal object SvgaSourceLoader {
   private val loaderScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
   suspend fun loadEntity(ctx: Context, source: String): SvgaEntity {
+    // SvgaMemoryCache.get returns the entity already retained on our behalf
+    // (+1). Caller owns that ref and must release.
     SvgaMemoryCache.get(source)?.let { return it }
 
     val deferred = CompletableDeferred<SvgaEntity>()
     val existing = inFlightEntities.putIfAbsent(source, deferred)
     if (existing != null) {
-      // Lost the leader race; just await whoever actually owns the load.
-      return existing.await()
+      // Lost the leader race; await the leader's value and retain on
+      // hand-off so each awaiter owns its own +1.
+      return existing.await().retain()
     }
 
     loaderScope.launch {
       try {
         val parsed = runInterruptible { loadEntityBlocking(ctx, source) }
+        // Cache takes its own +1. Awaiters retain on hand-off below; if no
+        // awaiter survives (cancellation), the cache still has its retain
+        // and the bitmaps stay alive until eviction.
         SvgaMemoryCache.put(source, parsed)
         deferred.complete(parsed)
       } catch (e: Throwable) {
@@ -56,7 +62,7 @@ internal object SvgaSourceLoader {
       }
     }
 
-    return deferred.await()
+    return deferred.await().retain()
   }
 
   private fun loadEntityBlocking(ctx: Context, source: String): SvgaEntity {

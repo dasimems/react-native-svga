@@ -28,6 +28,11 @@ internal enum SvgaSourceLoader {
         return URLSession(configuration: config)
     }()
 
+    /// Heavy work (`SvgaParser.parse` runs zlib/zip inflate up to 64 MB and
+    /// decodes every embedded image) is moved off the URLSession completion
+    /// queue so it doesn't starve concurrent downloads on the same queue.
+    private static let parseQueue = DispatchQueue(label: "svga.loader.parse", qos: .userInitiated, attributes: .concurrent)
+
     @discardableResult
     static func loadEntity(_ source: String, completion: @escaping (Result<SvgaEntity, Error>) -> Void) -> LoadCallbackId {
         if let cached = SvgaMemoryCache.shared.get(source) {
@@ -54,12 +59,18 @@ internal enum SvgaSourceLoader {
             case .failure(let err):
                 fanOut(source: source, result: .failure(err))
             case .success(let data):
-                do {
-                    let parsed = try SvgaParser.parse(data)
-                    SvgaMemoryCache.shared.put(source, parsed)
-                    fanOut(source: source, result: .success(parsed))
-                } catch {
-                    fanOut(source: source, result: .failure(error))
+                // Hop off the URLSession callback queue before parsing —
+                // a 64 MB inflate plus N image decodes here would block
+                // every other download whose completion lands on the
+                // same delegate queue.
+                parseQueue.async {
+                    do {
+                        let parsed = try SvgaParser.parse(data)
+                        SvgaMemoryCache.shared.put(source, parsed)
+                        fanOut(source: source, result: .success(parsed))
+                    } catch {
+                        fanOut(source: source, result: .failure(error))
+                    }
                 }
             }
         }
@@ -238,7 +249,9 @@ internal enum SvgaSourceLoader {
             switch result {
             case .failure(let err): completion(.failure(err))
             case .success(let data):
-                _ = try? SvgaDiskCache.saveSvga(resolved.value, data: data)
+                // Async so we don't pin the URLSession completion queue on
+                // a blocking write.
+                SvgaDiskCache.saveSvgaAsync(resolved.value, data: data)
                 completion(.success(data))
             }
         }

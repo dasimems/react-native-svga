@@ -16,7 +16,14 @@ internal class SvgaPlayerView(context: Context) : View(context) {
 
   var entity: SvgaEntity? = null
     set(value) {
-      field = value
+      // Hold our own +1 ownership while displayed, so cache eviction or
+      // a rapid source switch can't recycle the bitmaps under our draw
+      // pass. Release the prior entity AFTER assigning the new one — if
+      // both refer to the same cached entity (rare but possible) the
+      // refcount never dips to zero.
+      val prior = field
+      field = value?.retain()
+      prior?.release()
       reset()
       hasRendered = false
       if (value == null) {
@@ -58,7 +65,16 @@ internal class SvgaPlayerView(context: Context) : View(context) {
   private val tick = object : Runnable {
     override fun run() {
       if (!playing) return
-      advance()
+      // advance() invokes user-supplied onFrame/onLoop/onFinish callbacks.
+      // An exception in user code must not propagate out of run() — that
+      // would stop the Choreographer-style loop and silently freeze the
+      // player. Catch and log; the user's onError surface is intentionally
+      // not used here to avoid feedback loops if onError itself throws.
+      try {
+        advance()
+      } catch (t: Throwable) {
+        android.util.Log.e("SvgaPlayerView", "user callback threw during frame tick", t)
+      }
       val nowMs = System.currentTimeMillis()
       val drift = nowMs - nextFrameAt
       val delay = (frameInterval - drift).coerceAtLeast(0L)
@@ -74,7 +90,11 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     nextFrameAt = System.currentTimeMillis() + frameInterval
     if (!hasRendered) {
       hasRendered = true
-      onFrame?.onFrame(currentFrame, false)
+      try {
+        onFrame?.onFrame(currentFrame, false)
+      } catch (t: Throwable) {
+        android.util.Log.e("SvgaPlayerView", "onFrame callback threw", t)
+      }
       invalidate()
     }
     handler.postDelayed(tick, frameInterval)
@@ -104,6 +124,10 @@ internal class SvgaPlayerView(context: Context) : View(context) {
   fun release() {
     handler.removeCallbacks(tick)
     playing = false
+    // Drop our entity reference so the cache (or any other holder) can
+    // reach refcount zero and recycle bitmaps. Going through the setter
+    // also clears the playing/render state.
+    entity = null
   }
 
   override fun onDraw(canvas: Canvas) {
@@ -144,6 +168,11 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     val frame = frames[currentFrame]
     if (!frame.hasContent || frame.alpha <= 0f) return
     val bitmap = entity.bitmaps[sprite.imageKey] ?: return
+    // Defensive: refcount should keep this alive while we hold `entity`,
+    // but if a host app passed a bitmap it later recycled (or a refcount
+    // bug slips through), drawBitmap on a recycled bitmap throws and the
+    // exception propagates out of onDraw → ANR.
+    if (bitmap.isRecycled) return
     val bw = bitmap.width
     val bh = bitmap.height
     if (bw <= 0 || bh <= 0) return

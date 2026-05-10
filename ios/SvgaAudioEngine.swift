@@ -7,7 +7,9 @@ import Foundation
 /// Threading: every public method is expected to be called from the main
 /// thread. The interruption observer is also delivered to main. The only
 /// exception is `AVAudioPlayer.isPlaying`/`stop`, which Apple documents as
-/// thread-safe read accesses.
+/// thread-safe read accesses. Decoding (`AVAudioPlayer(data:)`) is offloaded
+/// to a global utility queue because constructor initialisation and
+/// `prepareToPlay` can stall main for tens of ms per track.
 internal final class SvgaAudioEngine {
 
     typealias AudioErrorHandler = (String) -> Void
@@ -34,6 +36,11 @@ internal final class SvgaAudioEngine {
     private var volume: Float = 1
     private var rate: Float = 1
     private var interruptionObserver: NSObjectProtocol?
+    /// Generation counter incremented on every `load` and `release`. Async
+    /// decode tasks compare against this before installing decoded tracks
+    /// to drop results that belong to a stale entity.
+    private var generation: UInt64 = 0
+    private static let decodeQueue = DispatchQueue(label: "svga.audio.decode", qos: .userInitiated, attributes: .concurrent)
     var onAudioError: AudioErrorHandler?
 
     init() {
@@ -68,22 +75,41 @@ internal final class SvgaAudioEngine {
     func load(_ entity: SvgaEntity) {
         unload()
         if entity.movie.audios.isEmpty { return }
-        for audio in entity.movie.audios {
-            guard let bytes = entity.audioData[audio.audioKey] else { continue }
-            do {
-                let player = try AVAudioPlayer(data: bytes)
+        generation += 1
+        let myGen = generation
+        // Snapshot (key, audio) pairs the parser produced. Heavy work
+        // (`AVAudioPlayer(data:)` + `prepareToPlay`) is per-track, so spread
+        // it across a concurrent decode queue and hop back to main to install.
+        let pending: [(AudioEntity, Data)] = entity.movie.audios.compactMap { audio in
+            guard let bytes = entity.audioData[audio.audioKey] else { return nil }
+            return (audio, bytes)
+        }
+        let snapshotVolume = volume
+        let snapshotRate = rate
+        for (audio, bytes) in pending {
+            Self.decodeQueue.async { [weak self] in
+                let player: AVAudioPlayer
+                do {
+                    player = try AVAudioPlayer(data: bytes)
+                } catch {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onAudioError?("audio load failed for \(audio.audioKey): \(error.localizedDescription)")
+                    }
+                    return
+                }
                 player.prepareToPlay()
-                player.volume = volume
+                player.volume = snapshotVolume
                 player.enableRate = true
-                player.rate = rate
-                tracks.append(Track(
-                    player: player,
-                    startFrame: audio.startFrame,
-                    endFrame: audio.endFrame
-                ))
-            } catch {
-                onAudioError?("audio load failed for \(audio.audioKey): \(error.localizedDescription)")
-                continue
+                player.rate = snapshotRate
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    if myGen != self.generation { return }  // entity replaced; drop
+                    self.tracks.append(Track(
+                        player: player,
+                        startFrame: audio.startFrame,
+                        endFrame: audio.endFrame
+                    ))
+                }
             }
         }
     }
@@ -123,6 +149,10 @@ internal final class SvgaAudioEngine {
     }
 
     func release() {
+        // Bumping the generation invalidates any in-flight decode tasks
+        // that haven't installed yet, so they don't push tracks into a
+        // released engine.
+        generation += 1
         stopAll()
         unload()
         // Remove the NotificationCenter observer eagerly; otherwise it
@@ -173,12 +203,24 @@ internal final class SvgaAudioEngine {
             }
             if !options.contains(.shouldResume) { return }
             if muted { return }
+            // The session is deactivated for the duration of the interruption
+            // (phone call, Siri, etc.) and AVAudioPlayer.play() silently
+            // returns false on a deactivated session. Re-activate before we
+            // try to resume — surface the activation failure if the host app
+            // has not configured an audio category that supports resumption.
+            do {
+                try AVAudioSession.sharedInstance().setActive(true)
+            } catch {
+                onAudioError?("audio session reactivation failed: \(error.localizedDescription)")
+                return
+            }
             for track in tracks {
                 // Only resume if (a) the track was playing pre-interruption
                 // and (b) it still has unplayed audio (so the frame-loop's
                 // endFrame stop didn't already retire it).
-                if track.wasPlayingBeforeInterrupt && track.player.currentTime > 0 {
-                    track.player.play()
+                guard track.wasPlayingBeforeInterrupt && track.player.currentTime > 0 else { continue }
+                if !track.player.play() {
+                    onAudioError?("audio resume failed after interruption")
                 }
             }
         @unknown default:

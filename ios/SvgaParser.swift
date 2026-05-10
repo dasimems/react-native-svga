@@ -79,7 +79,7 @@ internal enum SvgaParser {
                 t = CGAffineTransform(translationX: frame.layout.origin.x, y: frame.layout.origin.y)
                     .concatenating(t)
                 t = CGAffineTransform(scaleX: w / bw, y: h / bh).concatenating(t)
-                frame.transform = t
+                frame.applyComposedTransform(t)
             }
         }
     }
@@ -266,7 +266,9 @@ internal enum SvgaParser {
             let tag = try r.readTag()
             switch tag.field {
             case 1: imageKey = try r.readString()
-            case 2: frames.append(try parseFrame(try r.readSubReader()))
+            case 2:
+                if frames.count >= MAX_FRAMES { throw SvgaError("too many sprite frames") }
+                frames.append(try parseFrame(try r.readSubReader()))
             default: try r.skip(wire: tag.wire)
             }
         }
@@ -361,24 +363,28 @@ internal enum SvgaParser {
         guard data[0] == 0x1F && data[1] == 0x8B else { throw SvgaError("not a gzip stream") }
         guard data[2] == 0x08 else { throw SvgaError("unsupported gzip method") }
         let flags = data[3]
+        let trailerStart = data.count - 8
         var pos = 10
         if flags & 0x04 != 0 {
-            guard pos + 2 <= data.count else { throw SvgaError("truncated gzip extra") }
+            guard pos + 2 <= trailerStart else { throw SvgaError("truncated gzip extra") }
             let xlen = Int(data[pos]) | (Int(data[pos + 1]) << 8)
             pos += 2 + xlen
+            if pos > trailerStart { throw SvgaError("truncated gzip extra") }
         }
         if flags & 0x08 != 0 {
-            while pos < data.count && data[pos] != 0 { pos += 1 }
+            while pos < trailerStart && data[pos] != 0 { pos += 1 }
+            if pos >= trailerStart { throw SvgaError("truncated gzip name") }
             pos += 1
         }
         if flags & 0x10 != 0 {
-            while pos < data.count && data[pos] != 0 { pos += 1 }
+            while pos < trailerStart && data[pos] != 0 { pos += 1 }
+            if pos >= trailerStart { throw SvgaError("truncated gzip comment") }
             pos += 1
         }
         if flags & 0x02 != 0 {
             pos += 2
+            if pos > trailerStart { throw SvgaError("truncated gzip header crc") }
         }
-        let trailerStart = data.count - 8
         guard pos < trailerStart else { throw SvgaError("gzip payload missing") }
         return data.subdata(in: pos..<trailerStart)
     }
@@ -415,6 +421,8 @@ internal enum SvgaParser {
             stream.dst_size = bufferSize
 
             while true {
+                let priorSrcSize = stream.src_size
+                let priorDstSize = stream.dst_size
                 let status = compression_stream_process(&stream, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
                 if status == COMPRESSION_STATUS_ERROR {
                     thrown = SvgaError("deflate decode error")
@@ -427,6 +435,14 @@ internal enum SvgaParser {
                     return
                 }
                 if status == COMPRESSION_STATUS_END { return }
+                // Crafted streams can land the decoder in a state where it
+                // returns COMPRESSION_STATUS_OK without consuming source or
+                // producing output — the loop would then spin forever and
+                // pin a CPU core. Detect zero net progress and bail.
+                if stream.src_size == priorSrcSize && stream.dst_size == priorDstSize {
+                    thrown = SvgaError("deflate decoder stalled")
+                    return
+                }
                 stream.dst_ptr = buffer
                 stream.dst_size = bufferSize
             }
