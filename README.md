@@ -267,6 +267,8 @@ useEffect(() => {
 }, []);
 ```
 
+Preload is **idempotent** — items already on disk under the same `cacheKey` are skipped, no network request issued. Calling `preload(...)` repeatedly with the same input is therefore cheap; only entries missing from disk (or expired via `setMaxAgeMs`) are downloaded. If you bump a `cacheKey`, only that one entry re-downloads.
+
 The full facade:
 
 ```ts
@@ -347,6 +349,7 @@ const sources = [intro, body, outro];
 | Prop | Type | Default | Description |
 | --- | --- | --- | --- |
 | `source` | `string` | - | URL, file path, or bundled asset |
+| `cacheKey` | `string` | `source` | Identity used for cache lookup/storage. Defaults to `source`. Bump it (e.g. `"gift-2.v3"`) to force a fresh download for the same URL — the new bytes are stored under the new key, while any in-flight player still on the old key keeps playing it until released. |
 | `loops` | `number` | `0` | Number of loops; `0` = infinite |
 | `autoPlay` | `boolean` | `true` | Play immediately once loaded |
 | `speed` | `number` | `1.0` | Playback speed multiplier (0.05 minimum) |
