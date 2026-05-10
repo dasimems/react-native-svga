@@ -12,7 +12,7 @@ import {
   SvgaPlayer,
   type SvgaPlayerHandle,
   type SvgaSound,
-} from 'react-native-svga';
+} from '@dasimems/react-native-svga';
 
 // These URLs are reasonable third-party samples but may go down without
 // notice. Override them with your own hosted copies if the example breaks.

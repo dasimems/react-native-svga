@@ -1,5 +1,5 @@
 {
-  "name": "react-native-svga",
+  "name": "@dasimems/react-native-svga",
   "version": "0.1.0",
   "description": "SVGA player for react native",
   "main": "./lib/module/index.js",
@@ -59,7 +59,8 @@
   },
   "homepage": "https://github.com/dasimems/react-native-svga#readme",
   "publishConfig": {
-    "registry": "https://registry.npmjs.org/"
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
   },
   "devDependencies": {
     "@commitlint/config-conventional": "^19.8.1",

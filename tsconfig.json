@@ -2,7 +2,7 @@
   "compilerOptions": {
     "rootDir": ".",
     "paths": {
-      "react-native-svga": ["./src/index"]
+      "@dasimems/react-native-svga": ["./src/index"]
     },
     "allowUnreachableCode": false,
     "allowUnusedLabels": false,
