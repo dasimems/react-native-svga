@@ -75,6 +75,13 @@ internal class SvgaPlayerView(context: Context) : View(context) {
       } catch (t: Throwable) {
         android.util.Log.e("SvgaPlayerView", "user callback threw during frame tick", t)
       }
+      // Re-check `playing` after advance: a user callback (onFinish in
+      // particular) may have called stop()/pause() reentrantly. Without
+      // this check we'd post one more tick that would no-op at the gate
+      // above — harmless but wasteful, and it leaves a stale runnable in
+      // the handler queue across the (very brief) restart-before-tick
+      // window.
+      if (!playing) return
       val nowMs = System.currentTimeMillis()
       val drift = nowMs - nextFrameAt
       val delay = (frameInterval - drift).coerceAtLeast(0L)

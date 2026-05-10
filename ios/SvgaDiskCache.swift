@@ -144,6 +144,11 @@ internal enum SvgaDiskCache {
     private static func writeAtomic(_ target: URL, data: Data) throws {
         let tmp = target.appendingPathExtension("tmp")
         try data.write(to: tmp, options: .atomic)
+        // If `moveItem` succeeds, the cleanup is a no-op (tmp no longer
+        // exists at that path). If it throws (cross-volume, permission,
+        // racing process), the defer reaps the orphan so the cache dir
+        // doesn't accumulate `.tmp` siblings on every failed write.
+        defer { try? FileManager.default.removeItem(at: tmp) }
         if FileManager.default.fileExists(atPath: target.path) {
             try? FileManager.default.removeItem(at: target)
         }
@@ -156,21 +161,21 @@ internal enum SvgaDiskCache {
         guard let items = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys) else { return }
         var withMeta: [(url: URL, size: Int64, mtime: Date)] = []
         var total: Int64 = 0
-        var replacingBytes: Int64 = 0
         for item in items {
             let values = try? item.resourceValues(forKeys: Set(keys))
             let size = Int64(values?.fileSize ?? 0)
             let mtime = values?.contentModificationDate ?? Date.distantPast
-            if item.path == replacing.path {
-                replacingBytes = size
-                continue
-            }
+            // The slot we're about to overwrite contributes 0 to the
+            // post-write total — its bytes get replaced by `incoming`,
+            // not added to it. Skipping it here (vs counting then
+            // subtracting) keeps the budget calculation symmetric with
+            // the eviction loop below, which only walks `withMeta`.
+            if item.path == replacing.path { continue }
             withMeta.append((item, size, mtime))
             total += size
         }
         let target = limit - incoming
         if total <= target { return }
-        _ = replacingBytes
         withMeta.sort { $0.mtime < $1.mtime }
         for entry in withMeta {
             if total <= target { break }

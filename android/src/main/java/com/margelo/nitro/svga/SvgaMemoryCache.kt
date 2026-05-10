@@ -14,7 +14,15 @@ internal object SvgaMemoryCache {
 
   @Volatile private var initialized = false
   @Volatile private var explicitLimit: Long? = null
-  @Volatile private var cache: LruCache<String, SvgaEntity> = build(DEFAULT_LIMIT_BYTES)
+  // `val` (never reassigned) so concurrent readers in `get`/`put`/`clear`/
+  // `trimToHalf` can't race with a `setMaxBytes` swap. Capacity is mutated
+  // in place via `LruCache.resize` instead. A reassignment-based design
+  // would let a reader hold a reference to the old cache and observe a
+  // retained entity whose bitmaps `evictAll()` just recycled — `retain()`
+  // happily increments the refcount but the bitmaps are gone, leaving the
+  // player to silently skip-draw via the `bitmap.isRecycled` defence in
+  // SvgaPlayerView.
+  private val cache: LruCache<String, SvgaEntity> = build(DEFAULT_LIMIT_BYTES)
 
   fun ensureInit(context: Context) {
     if (initialized) return
@@ -23,8 +31,7 @@ internal object SvgaMemoryCache {
       val app = context.applicationContext
       val am = app.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
       val limit = explicitLimit ?: defaultLimitFor(am)
-      cache.evictAll()
-      cache = build(limit)
+      cache.resize(limit.toCapacity())
       app.registerComponentCallbacks(memoryCallbacks)
       // Inform the parser so its bitmap downsampling matches device class.
       SvgaParser.configureForDeviceClass(
@@ -39,10 +46,15 @@ internal object SvgaMemoryCache {
     val safe = bytes.coerceAtLeast(0L)
     synchronized(this) {
       explicitLimit = safe
-      cache.evictAll()
-      cache = build(safe)
+      // resize() trims in place to the new capacity (releasing oldest
+      // entries via entryRemoved → release()) without ever swapping the
+      // cache instance. Readers holding the same `cache` reference stay
+      // valid throughout.
+      cache.resize(safe.toCapacity())
     }
   }
+
+  private fun Long.toCapacity(): Int = coerceAtMost(Int.MAX_VALUE.toLong()).coerceAtLeast(1L).toInt()
 
   /// Returns a hit retained on behalf of the caller (+1). The caller is
   /// responsible for `release()`-ing when done. See `SvgaEntity` for the
@@ -50,8 +62,11 @@ internal object SvgaMemoryCache {
   fun get(key: String): SvgaEntity? = cache[key]?.retain()
 
   fun put(key: String, entity: SvgaEntity) {
-    if (cache.maxSize() <= 0) return
     // Cache holds its own +1; `entryRemoved` releases on eviction/replace.
+    // If the caller's `byteSize` exceeds `cache.maxSize()`, LruCache's
+    // post-put trim evicts the new entry immediately and `entryRemoved`
+    // balances our `retain()` — net effect is a no-op, which is what
+    // we want for an over-sized payload.
     cache.put(key, entity.retain())
   }
 
@@ -73,8 +88,7 @@ internal object SvgaMemoryCache {
   }
 
   private fun build(limit: Long): LruCache<String, SvgaEntity> {
-    val cap = limit.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-    return object : LruCache<String, SvgaEntity>(cap) {
+    return object : LruCache<String, SvgaEntity>(limit.toCapacity()) {
       override fun sizeOf(key: String, value: SvgaEntity): Int {
         val raw = value.byteSize + ENTRY_HEADROOM
         return raw.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
