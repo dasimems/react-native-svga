@@ -40,18 +40,35 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
 
     func isCached(url: String) throws -> Bool {
         guard let resolved = UrlValidator.resolve(url) else { return false }
-        if resolved.kind != .remote { return false }
-        return SvgaDiskCache.isCached(resolved.value)
+        switch resolved.kind {
+        case .remote:
+            return SvgaDiskCache.isCached(resolved.value)
+        case .localFile:
+            return FileManager.default.fileExists(atPath: resolved.value)
+        case .bundledAsset:
+            return Self.assetExists(resolved.value)
+        }
     }
 
     func getCachePath(url: String) throws -> String? {
         guard let resolved = UrlValidator.resolve(url) else { return nil }
-        if resolved.kind != .remote { return nil }
-        return SvgaDiskCache.pathOrNil(resolved.value)
+        switch resolved.kind {
+        case .remote:
+            return SvgaDiskCache.pathOrNil(resolved.value)
+        case .localFile:
+            return FileManager.default.fileExists(atPath: resolved.value) ? resolved.value : nil
+        case .bundledAsset:
+            return Self.assetExists(resolved.value) ? resolved.value : nil
+        }
+    }
+
+    private static func assetExists(_ name: String) -> Bool {
+        return SvgaSourceLoader.bundleURL(for: name) != nil
     }
 
     func clearCache() throws {
         try SvgaDiskCache.clearSvga()
+        try SvgaDiskCache.clearSounds()
         SvgaMemoryCache.shared.clear()
     }
 
@@ -85,6 +102,7 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
     func stopAllSounds() throws { sounds.stopAll() }
     func unloadSound(key: String) throws { sounds.unload(key: key) }
 
+    func dispose() { sounds.release() }
     deinit { sounds.release() }
 
     private func preloadAll(_ urls: [String]) async throws {

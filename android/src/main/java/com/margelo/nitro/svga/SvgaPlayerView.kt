@@ -19,6 +19,10 @@ internal class SvgaPlayerView(context: Context) : View(context) {
       field = value
       reset()
       hasRendered = false
+      if (value == null) {
+        playing = false
+        handler.removeCallbacks(tick)
+      }
       invalidate()
     }
 
@@ -163,7 +167,7 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     val isLast = nextFrame >= total
     if (isLast) {
       currentFrame = 0
-      loopCount += 1
+      if (loopCount < Int.MAX_VALUE) loopCount += 1
       onLoop?.onLoop(loopCount)
       if (maxLoops in 1..loopCount) {
         playing = false

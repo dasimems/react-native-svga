@@ -10,7 +10,21 @@ internal enum SvgaParser {
     private static let MAX_SPRITES = 10_000
     private static let DEFAULT_FPS = 15
     private static let MAX_INFLATED_BYTES = 64 * 1024 * 1024
-    private static let MAX_BITMAP_DIMENSION = 2048
+
+    /// Bitmap downsampling cap. Scales with device RAM so low-end iPhones
+    /// don't OOM on multi-sprite SVGAs at full resolution. Mutable so the
+    /// host (`HybridSvgaManager.init`) can compute it once at startup.
+    static var maxBitmapDimension: Int = defaultBitmapDimension()
+
+    private static func defaultBitmapDimension() -> Int {
+        let totalBytes = ProcessInfo.processInfo.physicalMemory
+        let totalGB = Double(totalBytes) / 1_073_741_824.0
+        switch totalGB {
+        case ..<2.0: return 1024
+        case ..<3.0: return 1536
+        default: return 2048
+        }
+    }
 
     // SVGA ships in several packagings, all decoded into the same SvgaEntity:
     //   - v2 zip:           PK\x03\x04 ... movie.binary plus images/ and audio/
@@ -147,7 +161,7 @@ internal enum SvgaParser {
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: MAX_BITMAP_DIMENSION,
+            kCGImageSourceThumbnailMaxPixelSize: maxBitmapDimension,
         ]
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }

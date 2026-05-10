@@ -17,7 +17,26 @@ internal object SvgaParser {
   private const val MAX_FRAMES = 100_000
   private const val MAX_SPRITES = 10_000
   private const val DEFAULT_FPS = 15
-  private const val MAX_BITMAP_DIMENSION = 2048
+  private const val LOW_RAM_BITMAP_DIMENSION = 1024
+  private const val MID_RAM_BITMAP_DIMENSION = 1536
+  private const val HIGH_RAM_BITMAP_DIMENSION = 2048
+
+  @Volatile private var maxBitmapDimension: Int = HIGH_RAM_BITMAP_DIMENSION
+
+  /**
+   * Lets the caller (typically `HybridSvga`/`HybridSvgaManager`) tune the
+   * bitmap decode cap based on the device's memory class. Smaller caps mean
+   * more aggressive downsampling, which is critical for low-RAM devices that
+   * load SVGAs containing multiple high-resolution sprites.
+   */
+  fun configureForDeviceClass(memoryClassMb: Int, isLowRamDevice: Boolean) {
+    maxBitmapDimension = when {
+      isLowRamDevice -> LOW_RAM_BITMAP_DIMENSION
+      memoryClassMb < 128 -> LOW_RAM_BITMAP_DIMENSION
+      memoryClassMb < 256 -> MID_RAM_BITMAP_DIMENSION
+      else -> HIGH_RAM_BITMAP_DIMENSION
+    }
+  }
 
   fun parse(input: InputStream): SvgaEntity {
     val bytes = input.use { readAllBounded(it, MAX_BUNDLE_BYTES) }
@@ -194,7 +213,8 @@ internal object SvgaParser {
     if (w <= 0 || h <= 0) return null
 
     var sampleSize = 1
-    while (maxOf(w, h) / sampleSize > MAX_BITMAP_DIMENSION) sampleSize *= 2
+    val cap = maxBitmapDimension
+    while (maxOf(w, h) / sampleSize > cap) sampleSize *= 2
 
     val opts = BitmapFactory.Options().apply {
       inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888

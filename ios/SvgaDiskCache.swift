@@ -7,6 +7,7 @@ internal enum SvgaDiskCache {
     private static let DEFAULT_LIMIT: Int64 = 50 * 1024 * 1024
     private static var maxBytes: Int64 = DEFAULT_LIMIT
     private static let queue = DispatchQueue(label: "svga.diskcache", attributes: .concurrent)
+    private static let writeQueue = DispatchQueue(label: "svga.diskcache.write")
 
     static func setMaxBytes(_ bytes: Int64) {
         queue.async(flags: .barrier) { maxBytes = max(0, bytes) }
@@ -29,21 +30,67 @@ internal enum SvgaDiskCache {
         return nil
     }
 
+    // touch on read so frequently-replayed entries don't get evicted by a
+    // single one-shot save. mtime drives eviction order in evictToMakeRoom.
+    static func cachedURL(_ source: String) -> URL? {
+        let url = svgaURL(for: source)
+        if !FileManager.default.fileExists(atPath: url.path) { return nil }
+        touch(url)
+        return url
+    }
+
+    static func cachedSoundURL(for key: String) -> URL? {
+        let url = soundURL(for: key)
+        if !FileManager.default.fileExists(atPath: url.path) { return nil }
+        touch(url)
+        return url
+    }
+
+    private static func touch(_ url: URL) {
+        try? FileManager.default.setAttributes(
+            [.modificationDate: Date()],
+            ofItemAtPath: url.path
+        )
+    }
+
     static func saveSvga(_ source: String, data: Data) throws -> URL {
         let url = svgaURL(for: source)
-        evictToMakeRoom(in: SVGA_DIR, limit: getMaxBytes(), incoming: Int64(data.count), replacing: url)
-        try writeAtomic(url, data: data)
+        var thrown: Error?
+        writeQueue.sync {
+            do {
+                evictToMakeRoom(in: SVGA_DIR, limit: getMaxBytes(), incoming: Int64(data.count), replacing: url)
+                try writeAtomic(url, data: data)
+            } catch {
+                thrown = error
+            }
+        }
+        if let thrown = thrown { throw thrown }
         return url
     }
 
     static func saveSound(_ key: String, data: Data) throws -> URL {
         let url = soundURL(for: key)
-        try writeAtomic(url, data: data)
+        var thrown: Error?
+        writeQueue.sync {
+            do {
+                evictToMakeRoom(in: SOUND_DIR, limit: getMaxBytes(), incoming: Int64(data.count), replacing: url)
+                try writeAtomic(url, data: data)
+            } catch {
+                thrown = error
+            }
+        }
+        if let thrown = thrown { throw thrown }
         return url
     }
 
     static func clearSvga() throws {
         let dir = try ensureDir(SVGA_DIR)
+        let items = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        for item in items { try? FileManager.default.removeItem(at: item) }
+    }
+
+    static func clearSounds() throws {
+        let dir = try ensureDir(SOUND_DIR)
         let items = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
         for item in items { try? FileManager.default.removeItem(at: item) }
     }

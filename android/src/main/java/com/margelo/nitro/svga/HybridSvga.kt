@@ -27,6 +27,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   private var entity: SvgaEntity? = null
   private var pendingPlayOnLoad = false
   private var wasPlayingBeforeWindowGone = false
+  private var userPaused = false
   private var loadToken = 0L
 
   override val view: View = playerView
@@ -101,6 +102,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   }
 
   override fun play() {
+    userPaused = false
     val current = entity
     if (current == null) {
       pendingPlayOnLoad = true
@@ -113,11 +115,17 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   }
 
   override fun pause() {
+    userPaused = true
+    pendingPlayOnLoad = false
+    wasPlayingBeforeWindowGone = false
     playerView.pause()
     audio.pauseAll()
   }
 
   override fun stop() {
+    pendingPlayOnLoad = false
+    wasPlayingBeforeWindowGone = false
+    userPaused = false
     playerView.stop()
     audio.stopAll()
   }
@@ -132,7 +140,12 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
 
   override fun isPlaying(): Boolean = playerView.isPlaying()
 
-  override fun onDestroy() {
+  // Nitro's eager-cleanup hook. JS calls this via dispose(), and we also
+  // call it ourselves from SvgaPlayer.tsx unmount because the auto-generated
+  // ViewManager.onDropViewInstance does NOT call dispose() — it only removes
+  // the view from its lookup map. Without an explicit dispose, the loadJob,
+  // CoroutineScope, audio engine, and MediaPlayers leak until JVM GC.
+  override fun dispose() {
     loadJob?.cancel()
     scope.cancel()
     playerView.release()
@@ -145,6 +158,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
     val token = loadToken
     pendingPlayOnLoad = false
     wasPlayingBeforeWindowGone = false
+    userPaused = false
     if (value.isEmpty()) {
       entity = null
       playerView.stop()
@@ -178,6 +192,10 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
     audio.setVolume(builtInAudioVolume.toFloat())
     audio.setRate(speed.toFloat())
     audio.load(parsed)
+    if (userPaused) {
+      pendingPlayOnLoad = false
+      return
+    }
     if (autoPlay || pendingPlayOnLoad) {
       pendingPlayOnLoad = false
       play()

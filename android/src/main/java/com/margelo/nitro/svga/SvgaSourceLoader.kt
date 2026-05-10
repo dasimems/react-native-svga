@@ -9,7 +9,10 @@ import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 import javax.net.ssl.HttpsURLConnection
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 
@@ -23,29 +26,37 @@ internal object SvgaSourceLoader {
 
   private val inFlightEntities = ConcurrentHashMap<String, CompletableDeferred<SvgaEntity>>()
 
+  // Loads run on a SupervisorJob-backed scope decoupled from any single
+  // caller's coroutine. Otherwise, if the leader caller (the one that
+  // started the load) gets cancelled by its parent (e.g. HybridSvga.dispose),
+  // the catch arm would propagate the CancellationException to the shared
+  // deferred, poisoning every other awaiter who was reusing the in-flight
+  // load via the dedup table.
+  private val loaderScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
   suspend fun loadEntity(ctx: Context, source: String): SvgaEntity {
     SvgaMemoryCache.get(source)?.let { return it }
 
     val deferred = CompletableDeferred<SvgaEntity>()
     val existing = inFlightEntities.putIfAbsent(source, deferred)
     if (existing != null) {
-      deferred.cancel()
+      // Lost the leader race; just await whoever actually owns the load.
       return existing.await()
     }
 
-    try {
-      val parsed = withContext(Dispatchers.IO) {
-        runInterruptible { loadEntityBlocking(ctx, source) }
+    loaderScope.launch {
+      try {
+        val parsed = runInterruptible { loadEntityBlocking(ctx, source) }
+        SvgaMemoryCache.put(source, parsed)
+        deferred.complete(parsed)
+      } catch (e: Throwable) {
+        deferred.completeExceptionally(e)
+      } finally {
+        inFlightEntities.remove(source)
       }
-      SvgaMemoryCache.put(source, parsed)
-      deferred.complete(parsed)
-      return parsed
-    } catch (e: Throwable) {
-      deferred.completeExceptionally(e)
-      throw e
-    } finally {
-      inFlightEntities.remove(source)
     }
+
+    return deferred.await()
   }
 
   private fun loadEntityBlocking(ctx: Context, source: String): SvgaEntity {
@@ -53,28 +64,49 @@ internal object SvgaSourceLoader {
     return stream.use { SvgaParser.parse(it) }
   }
 
-  fun preloadRemote(ctx: Context, url: String): File {
+  private fun sanitizeForLog(url: String): String {
+    val q = url.indexOf('?')
+    return if (q < 0) url else url.substring(0, q)
+  }
+
+  suspend fun preloadRemote(ctx: Context, url: String): File {
+    return withContext(Dispatchers.IO) {
+      runInterruptible { preloadRemoteBlocking(ctx, url) }
+    }
+  }
+
+  private fun preloadRemoteBlocking(ctx: Context, url: String): File {
     val existing = SvgaDiskCache.cachedFile(ctx, url)
     if (existing != null) return existing
     val bytes = downloadBytes(url)
     return SvgaDiskCache.saveSvga(ctx, url, bytes)
   }
 
-  fun loadSoundBytes(ctx: Context, key: String, url: String): File {
-    val existing = SvgaDiskCache.soundFile(ctx, key).takeIf { it.isFile }
-    if (existing != null) return existing
-    val resolved = UrlValidator.resolve(url) ?: throw SourceException("invalid sound url: $url")
+  suspend fun loadSoundBytes(ctx: Context, url: String): File {
+    return withContext(Dispatchers.IO) {
+      runInterruptible { loadSoundBytesBlocking(ctx, url) }
+    }
+  }
+
+  private fun loadSoundBytesBlocking(ctx: Context, url: String): File {
+    val resolved = UrlValidator.resolve(url) ?: throw SourceException("invalid sound url")
     if (resolved.kind == UrlValidator.Kind.LOCAL_FILE) return File(resolved.value)
+    // Disk-cache key is the URL (content-addressable). Keying by the user
+    // play-handle would make the cache stale when the same handle is
+    // reassigned to a different URL.
+    val cacheKey = resolved.value
+    val existing = SvgaDiskCache.cachedSound(ctx, cacheKey)
+    if (existing != null) return existing
     if (resolved.kind == UrlValidator.Kind.BUNDLED_ASSET) {
       val bytes = readAssetBytes(ctx, resolved.value)
-      return SvgaDiskCache.saveSound(ctx, key, bytes)
+      return SvgaDiskCache.saveSound(ctx, cacheKey, bytes)
     }
     val bytes = downloadBytes(resolved.value)
-    return SvgaDiskCache.saveSound(ctx, key, bytes)
+    return SvgaDiskCache.saveSound(ctx, cacheKey, bytes)
   }
 
   private fun openStream(ctx: Context, source: String): InputStream {
-    val resolved = UrlValidator.resolve(source) ?: throw SourceException("invalid source: $source")
+    val resolved = UrlValidator.resolve(source) ?: throw SourceException("invalid source")
     if (resolved.kind == UrlValidator.Kind.LOCAL_FILE) return File(resolved.value).inputStream()
     if (resolved.kind == UrlValidator.Kind.BUNDLED_ASSET) return ctx.assets.open(resolved.value)
     val cached = SvgaDiskCache.cachedFile(ctx, resolved.value)
@@ -100,7 +132,7 @@ internal object SvgaSourceLoader {
     }
     try {
       val code = conn.responseCode
-      if (code !in 200..299) throw SourceException("http $code for $url")
+      if (code !in 200..299) throw SourceException("http $code for ${sanitizeForLog(url)}")
       val declared = conn.contentLengthLong
       if (declared > MAX_DOWNLOAD_BYTES) throw SourceException("payload exceeds size limit")
       return conn.inputStream.use { readBounded(it, MAX_DOWNLOAD_BYTES) }

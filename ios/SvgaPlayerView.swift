@@ -13,6 +13,11 @@ internal final class SvgaPlayerView: UIView {
         didSet {
             reset()
             hasRendered = false
+            if entity == nil {
+                isPlaying = false
+                displayLink?.invalidate()
+                displayLink = nil
+            }
             setNeedsDisplay()
         }
     }
@@ -43,6 +48,11 @@ internal final class SvgaPlayerView: UIView {
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }
+
+    deinit {
+        displayLink?.invalidate()
+        displayLink = nil
+    }
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
@@ -167,7 +177,7 @@ internal final class SvgaPlayerView: UIView {
         let isLast = next >= total
         if isLast {
             currentFrame = 0
-            loopCount += 1
+            if loopCount < Int.max { loopCount += 1 }
             onLoop?(loopCount)
             if maxLoops > 0 && loopCount >= maxLoops {
                 isPlaying = false

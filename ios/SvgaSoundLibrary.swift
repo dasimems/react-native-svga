@@ -5,10 +5,10 @@ internal final class SvgaSoundLibrary {
 
     private final class Track {
         let player: AVAudioPlayer
-        var refCount: Int
-        init(_ player: AVAudioPlayer) {
+        let sourcePath: String
+        init(player: AVAudioPlayer, sourcePath: String) {
             self.player = player
-            self.refCount = 1
+            self.sourcePath = sourcePath
         }
     }
 
@@ -16,14 +16,16 @@ internal final class SvgaSoundLibrary {
     private let queue = DispatchQueue(label: "svga.sound.library")
 
     func load(key: String, url: URL) throws {
+        let newPath = url.path
         try queue.sync {
+            if let existing = tracks[key], existing.sourcePath == newPath { return }
             if let existing = tracks[key] {
-                existing.refCount += 1
-                return
+                existing.player.stop()
+                tracks.removeValue(forKey: key)
             }
             let player = try AVAudioPlayer(contentsOf: url)
             player.prepareToPlay()
-            tracks[key] = Track(player)
+            tracks[key] = Track(player: player, sourcePath: newPath)
         }
     }
 
@@ -51,11 +53,8 @@ internal final class SvgaSoundLibrary {
     func unload(key: String) {
         queue.async { [weak self] in
             guard let self = self else { return }
-            guard let track = self.tracks[key] else { return }
-            track.refCount -= 1
-            if track.refCount > 0 { return }
+            guard let track = self.tracks.removeValue(forKey: key) else { return }
             track.player.stop()
-            self.tracks.removeValue(forKey: key)
         }
     }
 

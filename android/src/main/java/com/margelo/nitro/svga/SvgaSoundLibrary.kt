@@ -10,17 +10,20 @@ import kotlin.concurrent.withLock
 
 internal class SvgaSoundLibrary(private val context: Context) {
 
-  private class Track(val player: MediaPlayer, var refCount: Int)
+  private class Track(val player: MediaPlayer, val sourcePath: String)
 
   private val tracks = ConcurrentHashMap<String, Track>()
   private val loadLock = ReentrantLock()
 
   fun load(key: String, source: File) {
+    val newPath = source.absolutePath
     loadLock.withLock {
       val existing = tracks[key]
+      if (existing != null && existing.sourcePath == newPath) return
       if (existing != null) {
-        existing.refCount += 1
-        return
+        try { existing.player.reset() } catch (_: Exception) {}
+        existing.player.release()
+        tracks.remove(key)
       }
       val player = MediaPlayer()
       player.setAudioAttributes(
@@ -30,9 +33,9 @@ internal class SvgaSoundLibrary(private val context: Context) {
           .build()
       )
       try {
-        player.setDataSource(source.absolutePath)
+        player.setDataSource(newPath)
         player.prepare()
-        tracks[key] = Track(player, 1)
+        tracks[key] = Track(player, newPath)
       } catch (e: Exception) {
         player.release()
         throw e
@@ -72,10 +75,7 @@ internal class SvgaSoundLibrary(private val context: Context) {
 
   fun unload(key: String) {
     loadLock.withLock {
-      val track = tracks[key] ?: return
-      track.refCount -= 1
-      if (track.refCount > 0) return
-      tracks.remove(key)
+      val track = tracks.remove(key) ?: return
       try { track.player.reset() } catch (_: Exception) {}
       track.player.release()
     }

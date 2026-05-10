@@ -16,6 +16,7 @@
   },
   "private": true,
   "devDependencies": {
+    "babel-preset-expo": "^55.0.21",
     "expo-dev-client": "~55.0.10",
     "react-native-builder-bob": "^0.40.13",
     "react-native-monorepo-config": "^0.3.3"

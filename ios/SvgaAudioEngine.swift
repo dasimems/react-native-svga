@@ -1,6 +1,13 @@
 import AVFoundation
 import Foundation
 
+/// Plays the audio tracks bundled inside an `.svga` file, frame-synced to the
+/// frame loop in `SvgaPlayerView`.
+///
+/// Threading: every public method is expected to be called from the main
+/// thread. The interruption observer is also delivered to main. The only
+/// exception is `AVAudioPlayer.isPlaying`/`stop`, which Apple documents as
+/// thread-safe read accesses.
 internal final class SvgaAudioEngine {
 
     typealias AudioErrorHandler = (String) -> Void
@@ -9,6 +16,11 @@ internal final class SvgaAudioEngine {
         let player: AVAudioPlayer
         let startFrame: Int
         let endFrame: Int
+        /// True iff this track was playing when the system audio session was
+        /// interrupted (e.g. phone call). Cleared when the track is told to
+        /// stop (either by `endFrame` or `stopAll`) so the post-interruption
+        /// resume doesn't restart audio whose playback range has already
+        /// passed.
         var wasPlayingBeforeInterrupt: Bool = false
         init(player: AVAudioPlayer, startFrame: Int, endFrame: Int) {
             self.player = player
@@ -29,9 +41,7 @@ internal final class SvgaAudioEngine {
     }
 
     deinit {
-        if let observer = interruptionObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
+        removeInterruptionObserver()
     }
 
     func setMuted(_ value: Bool) {
@@ -82,7 +92,12 @@ internal final class SvgaAudioEngine {
         if muted { return }
         for track in tracks {
             if frame == track.startFrame { track.player.play() }
-            if frame == track.endFrame { track.player.stop() }
+            if frame == track.endFrame {
+                track.player.stop()
+                // Track is past its end; if an interruption is active and
+                // ends later, we should NOT auto-resume this track.
+                track.wasPlayingBeforeInterrupt = false
+            }
         }
     }
 
@@ -103,12 +118,23 @@ internal final class SvgaAudioEngine {
         for track in tracks {
             track.player.stop()
             track.player.currentTime = 0
+            track.wasPlayingBeforeInterrupt = false
         }
     }
 
     func release() {
         stopAll()
         unload()
+        // Remove the NotificationCenter observer eagerly; otherwise it
+        // accumulates across rapid mount/unmount cycles when HybridSvga
+        // disposes its engine before ARC actually deallocates it.
+        removeInterruptionObserver()
+    }
+
+    private func removeInterruptionObserver() {
+        guard let observer = interruptionObserver else { return }
+        NotificationCenter.default.removeObserver(observer)
+        interruptionObserver = nil
     }
 
     private func unload() {
@@ -140,13 +166,20 @@ internal final class SvgaAudioEngine {
         case .ended:
             let optionsRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
             let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
+            // Always clear the flags, even if we don't resume (so a future
+            // interruption snapshot is fresh).
+            defer {
+                for track in tracks { track.wasPlayingBeforeInterrupt = false }
+            }
             if !options.contains(.shouldResume) { return }
             if muted { return }
             for track in tracks {
-                if track.wasPlayingBeforeInterrupt {
+                // Only resume if (a) the track was playing pre-interruption
+                // and (b) it still has unplayed audio (so the frame-loop's
+                // endFrame stop didn't already retire it).
+                if track.wasPlayingBeforeInterrupt && track.player.currentTime > 0 {
                     track.player.play()
                 }
-                track.wasPlayingBeforeInterrupt = false
             }
         @unknown default:
             return

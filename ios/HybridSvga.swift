@@ -10,7 +10,9 @@ final class HybridSvga: HybridSvgaSpec {
     private var pendingPlayOnLoad = false
     private var loadToken = 0
     private var activeSource: String?
+    private var activeLoadId: SvgaSourceLoader.LoadCallbackId = 0
     private var wasPlayingBeforeWindowGone = false
+    private var userPaused = false
     private let defaultFps = 15
     private let minSpeed: Double = 0.05
 
@@ -91,6 +93,7 @@ final class HybridSvga: HybridSvgaSpec {
     }
 
     func play() throws {
+        userPaused = false
         if entityRef == nil {
             pendingPlayOnLoad = true
             return
@@ -102,11 +105,17 @@ final class HybridSvga: HybridSvgaSpec {
     }
 
     func pause() throws {
+        userPaused = true
+        pendingPlayOnLoad = false
+        wasPlayingBeforeWindowGone = false
         playerView.pause()
         audio.pauseAll()
     }
 
     func stop() throws {
+        pendingPlayOnLoad = false
+        wasPlayingBeforeWindowGone = false
+        userPaused = false
         playerView.stop()
         audio.stopAll()
     }
@@ -123,20 +132,33 @@ final class HybridSvga: HybridSvgaSpec {
 
     func isPlaying() throws -> Bool { playerView.isPlaying }
 
-    deinit {
-        if let active = activeSource { SvgaSourceLoader.cancelLoad(active) }
+    func dispose() {
+        // JS-side eager cleanup. SvgaPlayer.tsx unmount calls this so we
+        // don't wait for JS GC to reclaim the handle. Idempotent — also
+        // safe to call from deinit if dispose was never invoked.
+        if let active = activeSource, activeLoadId != 0 {
+            SvgaSourceLoader.cancelLoad(active, callbackId: activeLoadId)
+            activeLoadId = 0
+        }
+        activeSource = nil
         playerView.release()
         audio.release()
     }
 
+    deinit {
+        dispose()
+    }
+
     private func handleSource(_ value: String) {
-        if let previous = activeSource, previous != value {
-            SvgaSourceLoader.cancelLoad(previous)
+        if let previous = activeSource, previous != value, activeLoadId != 0 {
+            SvgaSourceLoader.cancelLoad(previous, callbackId: activeLoadId)
         }
+        activeLoadId = 0
         loadToken += 1
         let token = loadToken
         pendingPlayOnLoad = false
         wasPlayingBeforeWindowGone = false
+        userPaused = false
         if value.isEmpty {
             activeSource = nil
             entityRef = nil
@@ -146,10 +168,11 @@ final class HybridSvga: HybridSvgaSpec {
             return
         }
         activeSource = value
-        SvgaSourceLoader.loadEntity(value) { [weak self] result in
+        activeLoadId = SvgaSourceLoader.loadEntity(value) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 if token != self.loadToken { return }
+                self.activeLoadId = 0
                 switch result {
                 case .failure(let error):
                     self.onError?(error.localizedDescription)
@@ -169,6 +192,10 @@ final class HybridSvga: HybridSvgaSpec {
         audio.setVolume(Float(builtInAudioVolume))
         audio.setRate(Float(speed))
         audio.load(entity)
+        if userPaused {
+            pendingPlayOnLoad = false
+            return
+        }
         if autoPlay || pendingPlayOnLoad {
             pendingPlayOnLoad = false
             try? play()

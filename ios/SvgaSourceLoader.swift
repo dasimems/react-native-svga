@@ -5,13 +5,17 @@ internal enum SvgaSourceLoader {
     private static let MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 
     private static var inFlight: [String: InFlightLoad] = [:]
+    private static var inFlightSounds: [String: URLSessionTask] = [:]
     private static let inFlightQueue = DispatchQueue(label: "svga.loader.inflight")
+    private static var nextCallbackId: UInt64 = 0
+
+    typealias LoadCallbackId = UInt64
 
     private final class InFlightLoad {
-        var callbacks: [(Result<SvgaEntity, Error>) -> Void]
-        var task: URLSessionDataTask?
-        init(_ callback: @escaping (Result<SvgaEntity, Error>) -> Void) {
-            self.callbacks = [callback]
+        var callbacks: [(id: LoadCallbackId, fn: (Result<SvgaEntity, Error>) -> Void)]
+        var task: URLSessionTask?
+        init(id: LoadCallbackId, callback: @escaping (Result<SvgaEntity, Error>) -> Void) {
+            self.callbacks = [(id, callback)]
         }
     }
 
@@ -24,22 +28,26 @@ internal enum SvgaSourceLoader {
         return URLSession(configuration: config)
     }()
 
-    static func loadEntity(_ source: String, completion: @escaping (Result<SvgaEntity, Error>) -> Void) {
+    @discardableResult
+    static func loadEntity(_ source: String, completion: @escaping (Result<SvgaEntity, Error>) -> Void) -> LoadCallbackId {
         if let cached = SvgaMemoryCache.shared.get(source) {
             completion(.success(cached))
-            return
+            return 0
         }
 
         var shouldStart = false
+        var callbackId: LoadCallbackId = 0
         inFlightQueue.sync {
-            if inFlight[source] == nil {
-                inFlight[source] = InFlightLoad(completion)
-                shouldStart = true
+            nextCallbackId += 1
+            callbackId = nextCallbackId
+            if let load = inFlight[source] {
+                load.callbacks.append((callbackId, completion))
             } else {
-                inFlight[source]?.callbacks.append(completion)
+                inFlight[source] = InFlightLoad(id: callbackId, callback: completion)
+                shouldStart = true
             }
         }
-        if !shouldStart { return }
+        if !shouldStart { return callbackId }
 
         loadData(source, attachTaskFor: source) { result in
             switch result {
@@ -55,28 +63,42 @@ internal enum SvgaSourceLoader {
                 }
             }
         }
+        return callbackId
     }
 
-    static func cancelLoad(_ source: String) {
-        var task: URLSessionDataTask?
+    /// Cancel a single registered callback. The underlying network task is
+    /// only cancelled when the last callback for that source is removed —
+    /// other consumers waiting on the same URL receive the result normally.
+    static func cancelLoad(_ source: String, callbackId: LoadCallbackId) {
+        if callbackId == 0 { return }
+        var task: URLSessionTask?
+        var callbacksToFire: [(Result<SvgaEntity, Error>) -> Void] = []
         inFlightQueue.sync {
-            task = inFlight[source]?.task
-            inFlight.removeValue(forKey: source)
+            guard let load = inFlight[source] else { return }
+            guard let idx = load.callbacks.firstIndex(where: { $0.id == callbackId }) else { return }
+            callbacksToFire.append(load.callbacks[idx].fn)
+            load.callbacks.remove(at: idx)
+            if load.callbacks.isEmpty {
+                task = load.task
+                inFlight.removeValue(forKey: source)
+            }
         }
         task?.cancel()
+        let cancellation = SvgaError("load cancelled")
+        for cb in callbacksToFire { cb(.failure(cancellation)) }
     }
 
     private static func fanOut(source: String, result: Result<SvgaEntity, Error>) {
         var callbacks: [(Result<SvgaEntity, Error>) -> Void] = []
         inFlightQueue.sync {
-            callbacks = inFlight.removeValue(forKey: source)?.callbacks ?? []
+            callbacks = inFlight.removeValue(forKey: source)?.callbacks.map { $0.fn } ?? []
         }
         for cb in callbacks { cb(result) }
     }
 
     static func preloadRemote(_ url: String, completion: @escaping (Result<URL, Error>) -> Void) {
-        if let cached = SvgaDiskCache.pathOrNil(url) {
-            completion(.success(URL(fileURLWithPath: cached)))
+        if let cached = SvgaDiskCache.cachedURL(url) {
+            completion(.success(cached))
             return
         }
         download(url) { result in
@@ -94,35 +116,38 @@ internal enum SvgaSourceLoader {
     }
 
     static func loadSoundFile(key: String, url: String, completion: @escaping (Result<URL, Error>) -> Void) {
-        let dest = SvgaDiskCache.soundURL(for: key)
-        if FileManager.default.fileExists(atPath: dest.path) {
-            completion(.success(dest))
-            return
-        }
         guard let resolved = UrlValidator.resolve(url) else {
-            completion(.failure(SvgaError("invalid sound url: \(url)")))
+            completion(.failure(SvgaError("invalid sound url")))
             return
         }
         if resolved.kind == .localFile {
             completion(.success(URL(fileURLWithPath: resolved.value)))
             return
         }
+        // Disk-cache is keyed by URL (content-addressable). Keying by the
+        // user play-handle would make the cache stale when the same handle
+        // is reassigned to a different URL.
+        let cacheKey = resolved.value
+        if let cached = SvgaDiskCache.cachedSoundURL(for: cacheKey) {
+            completion(.success(cached))
+            return
+        }
         if resolved.kind == .bundledAsset {
             do {
                 let data = try readBundleAsset(resolved.value)
-                let saved = try SvgaDiskCache.saveSound(key, data: data)
+                let saved = try SvgaDiskCache.saveSound(cacheKey, data: data)
                 completion(.success(saved))
             } catch {
                 completion(.failure(error))
             }
             return
         }
-        download(resolved.value) { result in
+        downloadSound(key: key, urlString: resolved.value) { result in
             switch result {
             case .failure(let err): completion(.failure(err))
             case .success(let data):
                 do {
-                    let saved = try SvgaDiskCache.saveSound(key, data: data)
+                    let saved = try SvgaDiskCache.saveSound(cacheKey, data: data)
                     completion(.success(saved))
                 } catch {
                     completion(.failure(error))
@@ -131,9 +156,55 @@ internal enum SvgaSourceLoader {
         }
     }
 
+    static func cancelSoundLoad(key: String) {
+        var task: URLSessionTask?
+        inFlightQueue.sync {
+            task = inFlightSounds.removeValue(forKey: key)
+        }
+        task?.cancel()
+    }
+
+    private static func downloadSound(key: String, urlString: String, completion: @escaping (Result<Data, Error>) -> Void) {
+        guard let url = URL(string: urlString) else {
+            completion(.failure(SvgaError("invalid url")))
+            return
+        }
+        let task = session.downloadTask(with: url) { tempURL, response, error in
+            inFlightQueue.sync { _ = inFlightSounds.removeValue(forKey: key) }
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+            guard let http = response as? HTTPURLResponse else {
+                completion(.failure(SvgaError("non-http response")))
+                return
+            }
+            if !(200..<300).contains(http.statusCode) {
+                completion(.failure(SvgaError("http \(http.statusCode)")))
+                return
+            }
+            guard let tempURL = tempURL else {
+                completion(.failure(SvgaError("download missing temp file")))
+                return
+            }
+            do {
+                let data = try Data(contentsOf: tempURL, options: .mappedIfSafe)
+                if data.count > MAX_DOWNLOAD_BYTES {
+                    completion(.failure(SvgaError("payload exceeds size limit")))
+                    return
+                }
+                completion(.success(data))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+        inFlightQueue.sync { inFlightSounds[key] = task }
+        task.resume()
+    }
+
     private static func loadData(_ source: String, attachTaskFor sourceForCancel: String? = nil, completion: @escaping (Result<Data, Error>) -> Void) {
         guard let resolved = UrlValidator.resolve(source) else {
-            completion(.failure(SvgaError("invalid source: \(source)")))
+            completion(.failure(SvgaError("invalid source")))
             return
         }
         if resolved.kind == .localFile {
@@ -154,9 +225,9 @@ internal enum SvgaSourceLoader {
             }
             return
         }
-        if let cachedPath = SvgaDiskCache.pathOrNil(resolved.value) {
+        if let cachedURL = SvgaDiskCache.cachedURL(resolved.value) {
             do {
-                let data = try Data(contentsOf: URL(fileURLWithPath: cachedPath), options: .mappedIfSafe)
+                let data = try Data(contentsOf: cachedURL, options: .mappedIfSafe)
                 completion(.success(data))
             } catch {
                 completion(.failure(error))
@@ -175,10 +246,10 @@ internal enum SvgaSourceLoader {
 
     private static func download(_ urlString: String, attachTaskFor sourceForCancel: String? = nil, completion: @escaping (Result<Data, Error>) -> Void) {
         guard let url = URL(string: urlString) else {
-            completion(.failure(SvgaError("invalid url: \(urlString)")))
+            completion(.failure(SvgaError("invalid url")))
             return
         }
-        let task = session.dataTask(with: url) { data, response, error in
+        let task = session.downloadTask(with: url) { tempURL, response, error in
             if let error = error {
                 completion(.failure(error))
                 return
@@ -191,30 +262,76 @@ internal enum SvgaSourceLoader {
                 completion(.failure(SvgaError("http \(http.statusCode)")))
                 return
             }
-            guard let data = data else {
-                completion(.failure(SvgaError("empty body")))
+            guard let tempURL = tempURL else {
+                completion(.failure(SvgaError("download missing temp file")))
                 return
             }
-            if data.count > MAX_DOWNLOAD_BYTES {
-                completion(.failure(SvgaError("payload exceeds size limit")))
-                return
+            do {
+                // mappedIfSafe lets us pass the bytes around without
+                // pinning the whole file in RAM. The mmap survives the
+                // upcoming temp-file deletion because it holds the inode.
+                let data = try Data(contentsOf: tempURL, options: .mappedIfSafe)
+                if data.count > MAX_DOWNLOAD_BYTES {
+                    completion(.failure(SvgaError("payload exceeds size limit")))
+                    return
+                }
+                completion(.success(data))
+            } catch {
+                completion(.failure(error))
             }
-            completion(.success(data))
         }
         if let key = sourceForCancel {
-            inFlightQueue.sync { inFlight[key]?.task = task }
+            var stillRegistered = false
+            inFlightQueue.sync {
+                if let load = inFlight[key] {
+                    load.task = task
+                    stillRegistered = true
+                }
+            }
+            if !stillRegistered {
+                // cancelLoad fired between callback registration and task creation;
+                // don't bother starting the download.
+                task.cancel()
+                return
+            }
         }
         task.resume()
     }
 
     private static func readBundleAsset(_ name: String) throws -> Data {
-        let bundle = Bundle.main
-        let parts = name.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: true)
-        let baseName = parts.first.map(String.init) ?? name
-        let ext = parts.count > 1 ? String(parts[1]) : nil
-        guard let url = bundle.url(forResource: baseName, withExtension: ext) else {
+        guard let url = bundleURL(for: name) else {
             throw SvgaError("bundled asset not found: \(name)")
         }
         return try Data(contentsOf: url)
+    }
+
+    /// Resolves a name like `animations/cheer.svga` to a Bundle URL,
+    /// honoring subdirectories and extensions.
+    static func bundleURL(for name: String) -> URL? {
+        let (subdirectory, base, ext) = splitBundleResource(name)
+        return Bundle.main.url(forResource: base, withExtension: ext, subdirectory: subdirectory)
+    }
+
+    /// Splits "animations/foo.bar.svga" into ("animations", "foo.bar", "svga"),
+    /// "cheer.svga" into (nil, "cheer", "svga"), "cheer" into (nil, "cheer", nil).
+    static func splitBundleResource(_ name: String) -> (subdirectory: String?, base: String, ext: String?) {
+        let subdirectory: String?
+        let fileName: String
+        if let lastSlash = name.lastIndex(of: "/") {
+            subdirectory = String(name[..<lastSlash])
+            fileName = String(name[name.index(after: lastSlash)...])
+        } else {
+            subdirectory = nil
+            fileName = name
+        }
+        let (base, ext) = splitBundleName(fileName)
+        return (subdirectory: subdirectory, base: base, ext: ext)
+    }
+
+    static func splitBundleName(_ name: String) -> (String, String?) {
+        guard let lastDot = name.lastIndex(of: ".") else { return (name, nil) }
+        let base = String(name[..<lastDot])
+        let ext = String(name[name.index(after: lastDot)...])
+        return (base, ext.isEmpty ? nil : ext)
     }
 }

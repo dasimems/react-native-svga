@@ -14,9 +14,19 @@ import {
   type SvgaSound,
 } from 'react-native-svga';
 
-const REMOTE_URL = 'https://assets.svga.io/svga/sample.svga';
-const SECONDARY_URL = 'https://assets.svga.io/svga/sample2.svga';
-const EXTERNAL_MP3 = 'https://www.kozco.com/tech/piano2-CoolEdit.mp3';
+// These URLs are reasonable third-party samples but may go down without
+// notice. Override them with your own hosted copies if the example breaks.
+// Set EXPO_PUBLIC_SVGA_SAMPLE_URL / SECONDARY_URL / EXTERNAL_MP3_URL in your
+// environment, or edit the constants below.
+const REMOTE_URL =
+  process.env.EXPO_PUBLIC_SVGA_SAMPLE_URL ||
+  'https://assets.svga.io/svga/sample.svga';
+const SECONDARY_URL =
+  process.env.EXPO_PUBLIC_SVGA_SECONDARY_URL ||
+  'https://assets.svga.io/svga/sample2.svga';
+const EXTERNAL_MP3 =
+  process.env.EXPO_PUBLIC_SVGA_EXTERNAL_MP3 ||
+  'https://www.kozco.com/tech/piano2-CoolEdit.mp3';
 
 type Scenario =
   | 'remote'

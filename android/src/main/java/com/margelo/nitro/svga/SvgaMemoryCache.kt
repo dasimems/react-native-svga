@@ -21,10 +21,16 @@ internal object SvgaMemoryCache {
     synchronized(this) {
       if (initialized) return
       val app = context.applicationContext
-      val limit = explicitLimit ?: defaultLimitFor(app)
+      val am = app.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+      val limit = explicitLimit ?: defaultLimitFor(am)
       cache.evictAll()
       cache = build(limit)
       app.registerComponentCallbacks(memoryCallbacks)
+      // Inform the parser so its bitmap downsampling matches device class.
+      SvgaParser.configureForDeviceClass(
+        memoryClassMb = am?.memoryClass ?: 256,
+        isLowRamDevice = am?.isLowRamDevice == true
+      )
       initialized = true
     }
   }
@@ -52,8 +58,8 @@ internal object SvgaMemoryCache {
     cache.trimToSize(target)
   }
 
-  private fun defaultLimitFor(context: Context): Long {
-    val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return DEFAULT_LIMIT_BYTES
+  private fun defaultLimitFor(am: ActivityManager?): Long {
+    if (am == null) return DEFAULT_LIMIT_BYTES
     return when {
       am.isLowRamDevice -> LOW_RAM_LIMIT_BYTES
       am.memoryClass < 128 -> LOW_RAM_LIMIT_BYTES
