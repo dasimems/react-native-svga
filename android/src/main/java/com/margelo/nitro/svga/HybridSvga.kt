@@ -6,6 +6,7 @@ import android.view.View
 import androidx.annotation.Keep
 import com.facebook.proguard.annotations.DoNotStrip
 import com.facebook.react.uimanager.ThemedReactContext
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -35,6 +36,13 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   private var userPaused = false
   private var loadToken = 0L
   @Volatile private var disposed = false
+  // Bumped on every `source`/`cacheKey` change. The deferred reload checks
+  // whether its captured generation is still current — if a later setter
+  // bumped it, we skip, so a single React commit that sets BOTH props
+  // triggers exactly one load (the second), not two with the first
+  // cancelled mid-flight. AtomicLong because Nitro setters can fire from
+  // a non-main thread under the new architecture.
+  private val reloadGeneration = AtomicLong(0L)
 
   override val view: View = playerView
 
@@ -43,8 +51,41 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
       val previous = field
       field = value
       if (value == previous) return
-      handleSource(value)
+      scheduleReload()
     }
+
+  /// Empty string ≡ "no override" — `handleSource` falls back to `source`.
+  /// Re-loads when the key changes (with the same source) because the cache
+  /// identity is what determines disk/memory hits.
+  override var cacheKey: String = ""
+    set(value) {
+      val previous = field
+      field = value
+      if (value == previous) return
+      scheduleReload()
+    }
+
+  /// Coalescing reload scheduler — see iOS HybridSvga for the rationale.
+  /// React typically commits `source` and `cacheKey` as two consecutive
+  /// Nitro property writes; without this, the first setter would fire a
+  /// load that the second would immediately cancel.
+  ///
+  /// We snapshot `source`/`cacheKey` on the SETTER thread (where the
+  /// calling setter just wrote `field = value`) and pass the snapshot into
+  /// the posted runnable. Reading them later from the main thread without
+  /// a snapshot would have no guaranteed happens-before with the setter
+  /// thread, risking a stale-source load. `main.post` provides the fence
+  /// that publishes our snapshot to the main thread.
+  private fun scheduleReload() {
+    val myGen = reloadGeneration.incrementAndGet()
+    val snapshotSource = source
+    val snapshotKey = cacheKey
+    main.post {
+      if (disposed) return@post
+      if (reloadGeneration.get() != myGen) return@post
+      handleSource(snapshotSource, snapshotKey)
+    }
+  }
 
   override var loops: Double = 0.0
     set(value) {
@@ -198,7 +239,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
     }
   }
 
-  private fun handleSource(value: String) {
+  private fun handleSource(value: String, rawKey: String) {
     if (disposed) return
     loadJob?.cancel()
     loadToken += 1
@@ -206,6 +247,8 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
     pendingPlayOnLoad = false
     wasPlayingBeforeWindowGone = false
     userPaused = false
+    // Empty cacheKey means "no override" → fall back to the source URL.
+    val resolvedKey: String? = if (rawKey.isEmpty()) null else rawKey
     if (value.isEmpty()) {
       entity?.release()
       entity = null
@@ -227,7 +270,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
         // withContext's suspension would throw CancellationException at the
         // hop boundary, the catch arm would swallow it, and `parsed` would
         // never be released.
-        parsed = SvgaSourceLoader.loadEntity(context.applicationContext, value)
+        parsed = SvgaSourceLoader.loadEntity(context.applicationContext, value, resolvedKey)
         // Pre-decode + synchronously prepare audio tracks on this IO
         // coroutine, BEFORE the main hop. `MediaPlayer.prepare()` blocks
         // for a few ms per track; doing it here means the tracks are

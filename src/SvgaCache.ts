@@ -1,5 +1,6 @@
 import { NitroModules } from 'react-native-nitro-modules';
 import type { SvgaManager } from './internal/SvgaManager.nitro';
+import type { SvgaPreloadInput } from './types';
 
 let cachedManager: SvgaManager | null = null;
 let cachedManagerError: unknown = null;
@@ -73,6 +74,51 @@ export interface PreloadOptions {
   timeoutMs?: number;
 }
 
+// Normalise a preload input into the parallel (urls, cacheKeys) shape the
+// native bridge expects. We validate up-front so a bad item raises a JS
+// TypeError before crossing the bridge — the native side trusts the arrays
+// are well-formed and aligned.
+const normalisePreloadInputs = (
+  items: ReadonlyArray<SvgaPreloadInput>
+): { urls: string[]; cacheKeys: string[] } => {
+  const urls: string[] = [];
+  const cacheKeys: string[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (typeof item === 'string') {
+      if (item.length === 0) {
+        throw new TypeError(
+          `SvgaCache.preload: items[${i}] is an empty string`
+        );
+      }
+      urls.push(item);
+      cacheKeys.push(item);
+      continue;
+    }
+    if (item == null || typeof item !== 'object') {
+      throw new TypeError(
+        `SvgaCache.preload: items[${i}] must be a string or { url, cacheKey? }`
+      );
+    }
+    const { url, cacheKey } = item;
+    if (typeof url !== 'string' || url.length === 0) {
+      throw new TypeError(
+        `SvgaCache.preload: items[${i}].url must be a non-empty string`
+      );
+    }
+    if (cacheKey !== undefined && typeof cacheKey !== 'string') {
+      throw new TypeError(
+        `SvgaCache.preload: items[${i}].cacheKey must be a string when provided`
+      );
+    }
+    urls.push(url);
+    // Empty cacheKey falls back to url so callers can pass `{ url }` for
+    // url-keyed entries without rewriting the call site.
+    cacheKeys.push(cacheKey && cacheKey.length > 0 ? cacheKey : url);
+  }
+  return { urls, cacheKeys };
+};
+
 const withCancellation = <T>(
   underlying: Promise<T>,
   options?: PreloadOptions
@@ -144,27 +190,107 @@ const withCancellation = <T>(
 };
 
 export const SvgaCache = {
-  preload: (urls: string[], options?: PreloadOptions): Promise<void> =>
-    withCancellation(getManager().preload(urls), options),
+  /**
+   * Warm the on-disk cache for a list of SVGAs. Each item may be a URL string
+   * (cache key defaults to the URL) or `{ url, cacheKey }`. Passing a custom
+   * cacheKey lets the same URL produce a fresh cache entry — useful when
+   * server-side content is updated without changing the URL.
+   */
+  preload: (
+    items: ReadonlyArray<SvgaPreloadInput>,
+    options?: PreloadOptions
+  ): Promise<void> => {
+    const { urls, cacheKeys } = normalisePreloadInputs(items);
+    return withCancellation(getManager().preload(urls, cacheKeys), options);
+  },
 
-  preloadDecoded: (urls: string[], options?: PreloadOptions): Promise<void> =>
-    withCancellation(getManager().preloadDecoded(urls), options),
+  /**
+   * Like `preload`, but also parses + decodes each entry into the in-memory
+   * cache so the next playback is instant. More expensive than `preload`.
+   */
+  preloadDecoded: (
+    items: ReadonlyArray<SvgaPreloadInput>,
+    options?: PreloadOptions
+  ): Promise<void> => {
+    const { urls, cacheKeys } = normalisePreloadInputs(items);
+    return withCancellation(
+      getManager().preloadDecoded(urls, cacheKeys),
+      options
+    );
+  },
 
-  has: (url: string): boolean => getManager().isCached(url),
+  /**
+   * Returns whether an entry is currently cached. Pass `cacheKey` to check
+   * by an explicit key; omit to fall back to the URL. Local-file and bundled
+   * sources are reported by their existence on disk regardless of cacheKey.
+   * Entries past `setMaxAgeMs` report as not cached even though the bytes
+   * still exist on disk — they'll be re-downloaded on next request.
+   */
+  has: (url: string, cacheKey?: string): boolean => {
+    if (typeof url !== 'string' || url.length === 0) {
+      throw new TypeError('SvgaCache.has: url must be a non-empty string');
+    }
+    return getManager().isCached(
+      cacheKey && cacheKey.length > 0 ? cacheKey : url
+    );
+  },
 
-  path: (url: string): string | undefined => getManager().getCachePath(url),
+  /**
+   * Returns the on-disk path of a cached entry, or `undefined` when not
+   * cached / expired. As with `has`, `cacheKey` defaults to the URL and TTL
+   * is honoured. Native nullable returns are normalised to `undefined` so
+   * callers can rely on a single sentinel.
+   */
+  path: (url: string, cacheKey?: string): string | undefined => {
+    if (typeof url !== 'string' || url.length === 0) {
+      throw new TypeError('SvgaCache.path: url must be a non-empty string');
+    }
+    const result = getManager().getCachePath(
+      cacheKey && cacheKey.length > 0 ? cacheKey : url
+    );
+    return result == null ? undefined : result;
+  },
 
+  /** Drops the entire on-disk + in-memory cache. */
   clear: (): void => getManager().clearCache(),
 
+  /** Total size of the on-disk SVGA cache, in bytes. */
   size: (): Promise<number> => getManager().getCacheSize(),
 
+  /** Number of entries currently in the on-disk SVGA cache. */
+  count: (): Promise<number> => getManager().getCacheCount(),
+
+  /**
+   * Set the maximum on-disk cache size, in bytes. When a write would exceed
+   * the limit, the LRU policy evicts the least-recently-used entries until
+   * the incoming entry fits.
+   */
   setLimit: (bytes: number): void => {
     assertNonNegativeFinite('SvgaCache.setLimit(bytes)', bytes);
     getManager().setCacheLimit(bytes);
   },
 
+  /** Set the maximum in-memory (parsed-entity) cache size, in bytes. */
   setMemoryLimit: (bytes: number): void => {
     assertNonNegativeFinite('SvgaCache.setMemoryLimit(bytes)', bytes);
     getManager().setMemoryLimit(bytes);
   },
+
+  /**
+   * Set the maximum age (TTL) for cached entries, in milliseconds. Entries
+   * older than `ms` are treated as cache misses — the next request triggers
+   * a fresh download. Pass `0` to disable TTL (entries live until LRU evicts
+   * them; this is the default).
+   */
+  setMaxAgeMs: (ms: number): void => {
+    assertNonNegativeFinite('SvgaCache.setMaxAgeMs(ms)', ms);
+    getManager().setMaxAgeMs(ms);
+  },
+
+  /**
+   * Sweep the on-disk cache and remove every entry whose age exceeds the
+   * configured `maxAgeMs`. Returns the number of entries removed. No-op
+   * when no `maxAgeMs` is configured.
+   */
+  evictExpired: (): Promise<number> => getManager().evictExpired(),
 };

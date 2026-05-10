@@ -6,6 +6,11 @@ internal enum SvgaDiskCache {
     private static let SOUND_DIR = "svga_sounds"
     private static let DEFAULT_LIMIT: Int64 = 50 * 1024 * 1024
     private static var maxBytes: Int64 = DEFAULT_LIMIT
+    /// Max age (TTL) in milliseconds. 0 disables TTL — entries live until LRU
+    /// evicts them. When set, reads of older-than-TTL entries return nil
+    /// (cache miss → fresh download), and `evictExpired()` walks the dirs to
+    /// reap them.
+    private static var maxAgeMs: Int64 = 0
     private static let queue = DispatchQueue(label: "svga.diskcache", attributes: .concurrent)
     private static let writeQueue = DispatchQueue(label: "svga.diskcache.write")
 
@@ -17,24 +22,45 @@ internal enum SvgaDiskCache {
         return queue.sync { maxBytes }
     }
 
-    static func svgaURL(for source: String) -> URL { fileURL(in: SVGA_DIR, key: Hashing.sha256(source)) }
-    static func soundURL(for key: String) -> URL { fileURL(in: SOUND_DIR, key: Hashing.sha256(key)) }
-
-    static func isCached(_ source: String) -> Bool {
-        return FileManager.default.fileExists(atPath: svgaURL(for: source).path)
+    static func setMaxAgeMs(_ ms: Int64) {
+        queue.async(flags: .barrier) { maxAgeMs = max(0, ms) }
     }
 
-    static func pathOrNil(_ source: String) -> String? {
-        let url = svgaURL(for: source)
-        if FileManager.default.fileExists(atPath: url.path) { return url.path }
-        return nil
+    static func getMaxAgeMs() -> Int64 {
+        return queue.sync { maxAgeMs }
+    }
+
+    /// SVGA cache slot for a `cacheKey`. We hash the key (not the URL) so
+    /// callers that pass an explicit cacheKey decoupled from the download
+    /// URL get a stable, content-addressable file path.
+    static func svgaURL(forKey cacheKey: String) -> URL {
+        fileURL(in: SVGA_DIR, key: Hashing.sha256(cacheKey))
+    }
+    static func soundURL(for key: String) -> URL { fileURL(in: SOUND_DIR, key: Hashing.sha256(key)) }
+
+    static func isCached(_ cacheKey: String) -> Bool {
+        let url = svgaURL(forKey: cacheKey)
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        return !isExpired(url)
+    }
+
+    static func pathOrNil(_ cacheKey: String) -> String? {
+        let url = svgaURL(forKey: cacheKey)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        if isExpired(url) { return nil }
+        return url.path
     }
 
     // touch on read so frequently-replayed entries don't get evicted by a
-    // single one-shot save. mtime drives eviction order in evictToMakeRoom.
-    static func cachedURL(_ source: String) -> URL? {
-        let url = svgaURL(for: source)
+    // single one-shot save. mtime drives both LRU eviction order in
+    // evictToMakeRoom AND the TTL check below — so an expired-but-touched
+    // entry would silently extend its life. We deliberately do NOT touch
+    // here when the entry has expired; the caller treats it as a miss and
+    // re-downloads, which writes a fresh mtime via `saveSvga`.
+    static func cachedURL(_ cacheKey: String) -> URL? {
+        let url = svgaURL(forKey: cacheKey)
         if !FileManager.default.fileExists(atPath: url.path) { return nil }
+        if isExpired(url) { return nil }
         touch(url)
         return url
     }
@@ -42,6 +68,7 @@ internal enum SvgaDiskCache {
     static func cachedSoundURL(for key: String) -> URL? {
         let url = soundURL(for: key)
         if !FileManager.default.fileExists(atPath: url.path) { return nil }
+        if isExpired(url) { return nil }
         touch(url)
         return url
     }
@@ -53,8 +80,17 @@ internal enum SvgaDiskCache {
         )
     }
 
-    static func saveSvga(_ source: String, data: Data) throws -> URL {
-        let url = svgaURL(for: source)
+    private static func isExpired(_ url: URL) -> Bool {
+        let ttl = getMaxAgeMs()
+        if ttl <= 0 { return false }
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+        guard let mtime = values?.contentModificationDate else { return false }
+        let ageMs = Int64(Date().timeIntervalSince(mtime) * 1000)
+        return ageMs > ttl
+    }
+
+    static func saveSvga(_ cacheKey: String, data: Data) throws -> URL {
+        let url = svgaURL(forKey: cacheKey)
         var thrown: Error?
         // Synchronous so callers receive a usable URL only after the bytes
         // are committed. Note: the *caller* (SvgaSourceLoader.preloadRemote
@@ -77,8 +113,8 @@ internal enum SvgaDiskCache {
     /// the URLSession completion queue). Errors are silently dropped — the
     /// download succeeded so the user-facing entity is delivered; cache
     /// failure only means the next load won't be a cache hit.
-    static func saveSvgaAsync(_ source: String, data: Data) {
-        let url = svgaURL(for: source)
+    static func saveSvgaAsync(_ cacheKey: String, data: Data) {
+        let url = svgaURL(forKey: cacheKey)
         writeQueue.async {
             do {
                 evictToMakeRoom(in: SVGA_DIR, limit: getMaxBytes(), incoming: Int64(data.count), replacing: url)
@@ -127,6 +163,54 @@ internal enum SvgaDiskCache {
         return total
     }
 
+    static func totalSvgaCount() -> Int {
+        guard let dir = try? ensureDir(SVGA_DIR) else { return 0 }
+        guard let items = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return 0 }
+        // .tmp siblings are atomic-write scratch files — exclude them so the
+        // count matches what callers can actually read back.
+        return items.filter { $0.pathExtension != "tmp" }.count
+    }
+
+    /// Walk the SVGA cache dir and remove every entry older than `maxAgeMs`,
+    /// invoking `completion` on `writeQueue` with the number removed.
+    ///
+    /// We use `writeQueue.async` rather than `.sync` so callers running on
+    /// the Swift cooperative thread pool (e.g. `Promise.async`) suspend via
+    /// the bridging continuation instead of parking a worker — a long
+    /// directory walk would otherwise tie up a cooperative-pool thread for
+    /// the duration, starving concurrent preload tasks that share the pool.
+    /// The async dispatch still serialises against `saveSvga`/`saveSound`
+    /// via the same `writeQueue`, so we never delete a file mid-rename.
+    static func evictExpired(completion: @escaping (Int) -> Void) {
+        let ttl = getMaxAgeMs()
+        if ttl <= 0 { completion(0); return }
+        writeQueue.async {
+            var removed = 0
+            guard let dir = try? ensureDir(SVGA_DIR) else { completion(0); return }
+            let keys: [URLResourceKey] = [.contentModificationDateKey]
+            guard let items = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys) else {
+                completion(0); return
+            }
+            let now = Date()
+            for item in items {
+                // Skip atomic-write scratch files; they get reaped by writeAtomic.
+                if item.pathExtension == "tmp" { continue }
+                let values = try? item.resourceValues(forKeys: Set(keys))
+                guard let mtime = values?.contentModificationDate else { continue }
+                let ageMs = Int64(now.timeIntervalSince(mtime) * 1000)
+                if ageMs <= ttl { continue }
+                do {
+                    try FileManager.default.removeItem(at: item)
+                    removed += 1
+                } catch {
+                    // best-effort — file may have been removed by a racing
+                    // process between listing and deletion. Don't count.
+                }
+            }
+            completion(removed)
+        }
+    }
+
     private static func fileURL(in folder: String, key: String) -> URL {
         let dir = (try? ensureDir(folder)) ?? FileManager.default.temporaryDirectory
         return dir.appendingPathComponent(key)
@@ -162,6 +246,9 @@ internal enum SvgaDiskCache {
         var withMeta: [(url: URL, size: Int64, mtime: Date)] = []
         var total: Int64 = 0
         for item in items {
+            // Don't include atomic-write scratch in the budget — they're
+            // not real cache entries and writeAtomic reaps them.
+            if item.pathExtension == "tmp" { continue }
             let values = try? item.resourceValues(forKeys: Set(keys))
             let size = Int64(values?.fileSize ?? 0)
             let mtime = values?.contentModificationDate ?? Date.distantPast
@@ -176,6 +263,7 @@ internal enum SvgaDiskCache {
         }
         let target = limit - incoming
         if total <= target { return }
+        // LRU: oldest mtime first so they evict before recent entries.
         withMeta.sort { $0.mtime < $1.mtime }
         for entry in withMeta {
             if total <= target { break }

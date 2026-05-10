@@ -33,31 +33,46 @@ internal enum SvgaSourceLoader {
     /// queue so it doesn't starve concurrent downloads on the same queue.
     private static let parseQueue = DispatchQueue(label: "svga.loader.parse", qos: .userInitiated, attributes: .concurrent)
 
+    /// Returns an effective cache key for a source — falls back to the source
+    /// itself when the caller didn't supply one. Keeps `loadEntity` and the
+    /// memory/disk caches keyed identically to pre-cacheKey behaviour for
+    /// string-only callers.
+    private static func resolveKey(_ source: String, _ explicit: String?) -> String {
+        if let key = explicit, !key.isEmpty { return key }
+        return source
+    }
+
     @discardableResult
-    static func loadEntity(_ source: String, completion: @escaping (Result<SvgaEntity, Error>) -> Void) -> LoadCallbackId {
-        if let cached = SvgaMemoryCache.shared.get(source) {
+    static func loadEntity(_ source: String, cacheKey: String? = nil, completion: @escaping (Result<SvgaEntity, Error>) -> Void) -> LoadCallbackId {
+        let key = resolveKey(source, cacheKey)
+        if let cached = SvgaMemoryCache.shared.get(key) {
             completion(.success(cached))
             return 0
         }
 
         var shouldStart = false
         var callbackId: LoadCallbackId = 0
+        // Dedup by cacheKey, not source URL — two concurrent loads for the
+        // same content (same key) coalesce into one fetch even if the user
+        // passed slightly different signed URLs. Conversely, two different
+        // cacheKeys never coalesce: rotating the key means "new identity",
+        // which is the whole point of the API.
         inFlightQueue.sync {
             nextCallbackId += 1
             callbackId = nextCallbackId
-            if let load = inFlight[source] {
+            if let load = inFlight[key] {
                 load.callbacks.append((callbackId, completion))
             } else {
-                inFlight[source] = InFlightLoad(id: callbackId, callback: completion)
+                inFlight[key] = InFlightLoad(id: callbackId, callback: completion)
                 shouldStart = true
             }
         }
         if !shouldStart { return callbackId }
 
-        loadData(source, attachTaskFor: source) { result in
+        loadData(source, cacheKey: key, attachTaskFor: key) { result in
             switch result {
             case .failure(let err):
-                fanOut(source: source, result: .failure(err))
+                fanOut(key: key, result: .failure(err))
             case .success(let data):
                 // Hop off the URLSession callback queue before parsing —
                 // a 64 MB inflate plus N image decodes here would block
@@ -66,10 +81,10 @@ internal enum SvgaSourceLoader {
                 parseQueue.async {
                     do {
                         let parsed = try SvgaParser.parse(data)
-                        SvgaMemoryCache.shared.put(source, parsed)
-                        fanOut(source: source, result: .success(parsed))
+                        SvgaMemoryCache.shared.put(key, parsed)
+                        fanOut(key: key, result: .success(parsed))
                     } catch {
-                        fanOut(source: source, result: .failure(error))
+                        fanOut(key: key, result: .failure(error))
                     }
                 }
             }
@@ -80,18 +95,19 @@ internal enum SvgaSourceLoader {
     /// Cancel a single registered callback. The underlying network task is
     /// only cancelled when the last callback for that source is removed —
     /// other consumers waiting on the same URL receive the result normally.
-    static func cancelLoad(_ source: String, callbackId: LoadCallbackId) {
+    static func cancelLoad(_ source: String, cacheKey: String? = nil, callbackId: LoadCallbackId) {
         if callbackId == 0 { return }
+        let key = resolveKey(source, cacheKey)
         var task: URLSessionTask?
         var callbacksToFire: [(Result<SvgaEntity, Error>) -> Void] = []
         inFlightQueue.sync {
-            guard let load = inFlight[source] else { return }
+            guard let load = inFlight[key] else { return }
             guard let idx = load.callbacks.firstIndex(where: { $0.id == callbackId }) else { return }
             callbacksToFire.append(load.callbacks[idx].fn)
             load.callbacks.remove(at: idx)
             if load.callbacks.isEmpty {
                 task = load.task
-                inFlight.removeValue(forKey: source)
+                inFlight.removeValue(forKey: key)
             }
         }
         task?.cancel()
@@ -99,16 +115,17 @@ internal enum SvgaSourceLoader {
         for cb in callbacksToFire { cb(.failure(cancellation)) }
     }
 
-    private static func fanOut(source: String, result: Result<SvgaEntity, Error>) {
+    private static func fanOut(key: String, result: Result<SvgaEntity, Error>) {
         var callbacks: [(Result<SvgaEntity, Error>) -> Void] = []
         inFlightQueue.sync {
-            callbacks = inFlight.removeValue(forKey: source)?.callbacks.map { $0.fn } ?? []
+            callbacks = inFlight.removeValue(forKey: key)?.callbacks.map { $0.fn } ?? []
         }
         for cb in callbacks { cb(result) }
     }
 
-    static func preloadRemote(_ url: String, completion: @escaping (Result<URL, Error>) -> Void) {
-        if let cached = SvgaDiskCache.cachedURL(url) {
+    static func preloadRemote(_ url: String, cacheKey: String? = nil, completion: @escaping (Result<URL, Error>) -> Void) {
+        let key = resolveKey(url, cacheKey)
+        if let cached = SvgaDiskCache.cachedURL(key) {
             completion(.success(cached))
             return
         }
@@ -117,7 +134,7 @@ internal enum SvgaSourceLoader {
             case .failure(let err): completion(.failure(err))
             case .success(let data):
                 do {
-                    let saved = try SvgaDiskCache.saveSvga(url, data: data)
+                    let saved = try SvgaDiskCache.saveSvga(key, data: data)
                     completion(.success(saved))
                 } catch {
                     completion(.failure(error))
@@ -213,7 +230,7 @@ internal enum SvgaSourceLoader {
         task.resume()
     }
 
-    private static func loadData(_ source: String, attachTaskFor sourceForCancel: String? = nil, completion: @escaping (Result<Data, Error>) -> Void) {
+    private static func loadData(_ source: String, cacheKey: String, attachTaskFor sourceForCancel: String? = nil, completion: @escaping (Result<Data, Error>) -> Void) {
         guard let resolved = UrlValidator.resolve(source) else {
             completion(.failure(SvgaError("invalid source")))
             return
@@ -236,7 +253,7 @@ internal enum SvgaSourceLoader {
             }
             return
         }
-        if let cachedURL = SvgaDiskCache.cachedURL(resolved.value) {
+        if let cachedURL = SvgaDiskCache.cachedURL(cacheKey) {
             do {
                 let data = try Data(contentsOf: cachedURL, options: .mappedIfSafe)
                 completion(.success(data))
@@ -250,8 +267,9 @@ internal enum SvgaSourceLoader {
             case .failure(let err): completion(.failure(err))
             case .success(let data):
                 // Async so we don't pin the URLSession completion queue on
-                // a blocking write.
-                SvgaDiskCache.saveSvgaAsync(resolved.value, data: data)
+                // a blocking write. Save under the explicit cacheKey so
+                // subsequent reads via the same key hit.
+                SvgaDiskCache.saveSvgaAsync(cacheKey, data: data)
                 completion(.success(data))
             }
         }

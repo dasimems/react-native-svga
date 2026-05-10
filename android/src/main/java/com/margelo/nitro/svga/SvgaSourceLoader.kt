@@ -24,6 +24,10 @@ internal object SvgaSourceLoader {
 
   class SourceException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
+  // Dedup by cache key — two concurrent loads for the same content
+  // (same key) coalesce into one fetch even if they passed slightly
+  // different signed URLs. Different cacheKeys never coalesce: rotating
+  // the key means "new identity", which is the whole point of the API.
   private val inFlightEntities = ConcurrentHashMap<String, CompletableDeferred<SvgaEntity>>()
 
   // Loads run on a SupervisorJob-backed scope decoupled from any single
@@ -34,13 +38,22 @@ internal object SvgaSourceLoader {
   // load via the dedup table.
   private val loaderScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-  suspend fun loadEntity(ctx: Context, source: String): SvgaEntity {
+  /// Effective cache key for a source — falls back to the source itself when
+  /// the caller didn't supply one. Keeps memory/disk caches keyed identically
+  /// to pre-cacheKey behaviour for string-only callers.
+  private fun resolveKey(source: String, explicit: String?): String {
+    if (explicit != null && explicit.isNotEmpty()) return explicit
+    return source
+  }
+
+  suspend fun loadEntity(ctx: Context, source: String, cacheKey: String? = null): SvgaEntity {
+    val key = resolveKey(source, cacheKey)
     // SvgaMemoryCache.get returns the entity already retained on our behalf
     // (+1). Caller owns that ref and must release.
-    SvgaMemoryCache.get(source)?.let { return it }
+    SvgaMemoryCache.get(key)?.let { return it }
 
     val deferred = CompletableDeferred<SvgaEntity>()
-    val existing = inFlightEntities.putIfAbsent(source, deferred)
+    val existing = inFlightEntities.putIfAbsent(key, deferred)
     if (existing != null) {
       // Lost the leader race; await the leader's value and retain on
       // hand-off so each awaiter owns its own +1.
@@ -49,24 +62,24 @@ internal object SvgaSourceLoader {
 
     loaderScope.launch {
       try {
-        val parsed = runInterruptible { loadEntityBlocking(ctx, source) }
+        val parsed = runInterruptible { loadEntityBlocking(ctx, source, key) }
         // Cache takes its own +1. Awaiters retain on hand-off below; if no
         // awaiter survives (cancellation), the cache still has its retain
         // and the bitmaps stay alive until eviction.
-        SvgaMemoryCache.put(source, parsed)
+        SvgaMemoryCache.put(key, parsed)
         deferred.complete(parsed)
       } catch (e: Throwable) {
         deferred.completeExceptionally(e)
       } finally {
-        inFlightEntities.remove(source)
+        inFlightEntities.remove(key)
       }
     }
 
     return deferred.await().retain()
   }
 
-  private fun loadEntityBlocking(ctx: Context, source: String): SvgaEntity {
-    val stream = openStream(ctx, source)
+  private fun loadEntityBlocking(ctx: Context, source: String, cacheKey: String): SvgaEntity {
+    val stream = openStream(ctx, source, cacheKey)
     return stream.use { SvgaParser.parse(it) }
   }
 
@@ -75,17 +88,18 @@ internal object SvgaSourceLoader {
     return if (q < 0) url else url.substring(0, q)
   }
 
-  suspend fun preloadRemote(ctx: Context, url: String): File {
+  suspend fun preloadRemote(ctx: Context, url: String, cacheKey: String? = null): File {
+    val key = resolveKey(url, cacheKey)
     return withContext(Dispatchers.IO) {
-      runInterruptible { preloadRemoteBlocking(ctx, url) }
+      runInterruptible { preloadRemoteBlocking(ctx, url, key) }
     }
   }
 
-  private fun preloadRemoteBlocking(ctx: Context, url: String): File {
-    val existing = SvgaDiskCache.cachedFile(ctx, url)
+  private fun preloadRemoteBlocking(ctx: Context, url: String, cacheKey: String): File {
+    val existing = SvgaDiskCache.cachedFile(ctx, cacheKey)
     if (existing != null) return existing
     val bytes = downloadBytes(url)
-    return SvgaDiskCache.saveSvga(ctx, url, bytes)
+    return SvgaDiskCache.saveSvga(ctx, cacheKey, bytes)
   }
 
   suspend fun loadSoundBytes(ctx: Context, url: String): File {
@@ -111,14 +125,14 @@ internal object SvgaSourceLoader {
     return SvgaDiskCache.saveSound(ctx, cacheKey, bytes)
   }
 
-  private fun openStream(ctx: Context, source: String): InputStream {
+  private fun openStream(ctx: Context, source: String, cacheKey: String): InputStream {
     val resolved = UrlValidator.resolve(source) ?: throw SourceException("invalid source")
     if (resolved.kind == UrlValidator.Kind.LOCAL_FILE) return File(resolved.value).inputStream()
     if (resolved.kind == UrlValidator.Kind.BUNDLED_ASSET) return ctx.assets.open(resolved.value)
-    val cached = SvgaDiskCache.cachedFile(ctx, resolved.value)
+    val cached = SvgaDiskCache.cachedFile(ctx, cacheKey)
     if (cached != null) return cached.inputStream()
     val bytes = downloadBytes(resolved.value)
-    val saved = SvgaDiskCache.saveSvga(ctx, resolved.value, bytes)
+    val saved = SvgaDiskCache.saveSvga(ctx, cacheKey, bytes)
     return saved.inputStream()
   }
 

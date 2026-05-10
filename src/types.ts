@@ -11,6 +11,21 @@ export interface SvgaSound {
   volume?: number;
 }
 
+/**
+ * A single item passed to `SvgaCache.preload`. A bare URL string is treated as
+ * `{ url, cacheKey: url }`, preserving the previous string-array API. Passing
+ * `{ url, cacheKey }` decouples cache identity from the download URL — useful
+ * when the bytes at a stable URL can change (signed URLs, content-version
+ * bumps, tenant-scoped assets, etc.). Bumping `cacheKey` triggers a fresh
+ * download on next request without changing the URL surface.
+ */
+export interface SvgaPreloadItem {
+  url: string;
+  cacheKey?: string;
+}
+
+export type SvgaPreloadInput = string | SvgaPreloadItem;
+
 export interface SvgaPlayerHandle {
   play: () => void;
   pause: () => void;
@@ -22,6 +37,14 @@ export interface SvgaPlayerHandle {
 
 export interface SvgaPlayerProps {
   source: string;
+
+  /**
+   * Identity used for cache lookup and storage. Defaults to `source` when
+   * omitted. Change `cacheKey` to force a fresh download for the same URL —
+   * the new bytes are stored under the new key, and any in-flight player
+   * already showing the old key keeps playing it until released.
+   */
+  cacheKey?: string;
 
   loops?: number;
   autoPlay?: boolean;

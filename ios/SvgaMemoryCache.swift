@@ -6,16 +6,24 @@ internal final class SvgaMemoryCache {
     static let shared = SvgaMemoryCache()
 
     private let cache = NSCache<NSString, CachedEntity>()
-    /// Guards `setMaxBytes` and the `put`-time read of `cache.totalCostLimit`.
-    /// NSCache itself is internally synchronised, but the gating compare in
-    /// `put` (skip when limit == 0) and the matched read+write in
-    /// `setMaxBytes` need to be serialised against the new concurrent
-    /// `parseQueue` workers that all funnel into `put`.
+    /// Guards `setMaxBytes`, `setMaxAgeMs`, the `put`-time read of
+    /// `cache.totalCostLimit`, and the TTL counters. NSCache itself is
+    /// internally synchronised, but the gating compares (skip when limit == 0,
+    /// expired-on-get) and the matched read+write of TTL state need to be
+    /// serialised against the concurrent `parseQueue` workers that all
+    /// funnel into `put`.
     private let lock = os_unfair_lock_t.allocate(capacity: 1)
+    private var maxAgeMs: Int64 = 0
 
     private final class CachedEntity {
         let entity: SvgaEntity
-        init(_ entity: SvgaEntity) { self.entity = entity }
+        // Wall-clock storage time; used for TTL filtering on read. Bumped on
+        // every `put` so a re-download under the same key extends life.
+        let storedAt: Date
+        init(_ entity: SvgaEntity) {
+            self.entity = entity
+            self.storedAt = Date()
+        }
     }
 
     init() {
@@ -35,20 +43,52 @@ internal final class SvgaMemoryCache {
         os_unfair_lock_unlock(lock)
     }
 
-    func get(_ key: String) -> SvgaEntity? {
-        return cache.object(forKey: key as NSString)?.entity
+    func setMaxAgeMs(_ ms: Int64) {
+        let safe = max(0, ms)
+        os_unfair_lock_lock(lock)
+        maxAgeMs = safe
+        os_unfair_lock_unlock(lock)
     }
 
+    /// Holds the lock across the cache observation, TTL check, and removal so
+    /// a concurrent `put` for the same key cannot slip a fresh wrapper in
+    /// between our staleness decision and the eviction call. Without this,
+    /// the stale-then-fresh-put-then-removal interleaving would erase the
+    /// freshly-cached entity, forcing a redundant re-download on the next get.
+    /// We additionally identity-compare via `===` before removing, so even if
+    /// NSCache's internal eviction races our held lock, we never delete a
+    /// wrapper we didn't observe.
+    func get(_ key: String) -> SvgaEntity? {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        guard let cached = cache.object(forKey: key as NSString) else { return nil }
+        if maxAgeMs > 0 {
+            let ageMs = Int64(Date().timeIntervalSince(cached.storedAt) * 1000)
+            if ageMs > maxAgeMs {
+                if let current = cache.object(forKey: key as NSString), current === cached {
+                    cache.removeObject(forKey: key as NSString)
+                }
+                return nil
+            }
+        }
+        return cached.entity
+    }
+
+    /// Lock held across the limit read AND the actual `setObject` call so
+    /// concurrent `get`s observe a consistent view of the cache state.
     func put(_ key: String, _ entity: SvgaEntity) {
         os_unfair_lock_lock(lock)
-        let limit = cache.totalCostLimit
-        os_unfair_lock_unlock(lock)
-        if limit <= 0 { return }
+        defer { os_unfair_lock_unlock(lock) }
+        if cache.totalCostLimit <= 0 { return }
         let cost = max(1, entity.byteSize)
         cache.setObject(CachedEntity(entity), forKey: key as NSString, cost: cost)
     }
 
-    func clear() { cache.removeAllObjects() }
+    func clear() {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        cache.removeAllObjects()
+    }
 
     private static func defaultLimit() -> Int {
         let totalBytes = ProcessInfo.processInfo.physicalMemory

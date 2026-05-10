@@ -5,5 +5,7 @@ export type {
   SoundPlayOn,
   SvgaPlayerHandle,
   SvgaPlayerProps,
+  SvgaPreloadInput,
+  SvgaPreloadItem,
   SvgaSound,
 } from './types';

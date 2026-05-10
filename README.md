@@ -270,16 +270,41 @@ useEffect(() => {
 The full facade:
 
 ```ts
-SvgaCache.preload(urls);          // returns Promise<void>
-SvgaCache.has(url);               // boolean - is the .svga on disk?
-SvgaCache.path(url);              // string | null - local cache path
-await SvgaCache.size();           // number - total bytes on disk
-SvgaCache.setLimit(50 * 1024 * 1024);       // disk bytes; oldest evicted first
-SvgaCache.setMemoryLimit(16 * 1024 * 1024); // in-memory decoded entity bytes
-SvgaCache.clear();                          // wipes both disk and in-memory caches
+// Preload accepts plain URLs or { url, cacheKey } items. Use `cacheKey` to
+// decouple cache identity from the download URL — bumping the key forces a
+// fresh download and stores the new bytes under the new key, leaving any
+// in-flight player on the old key untouched until it releases.
+SvgaCache.preload([
+  'https://cdn.example/gift-1.svga',                            // url-keyed
+  { url: 'https://cdn.example/gift-2.svga', cacheKey: 'g2-v3' },// versioned
+]);
+
+SvgaCache.has(url);                          // boolean — disk hit?
+SvgaCache.has(url, cacheKey);                // boolean — disk hit under cacheKey?
+SvgaCache.path(url);                         // string | undefined — disk path
+SvgaCache.path(url, cacheKey);               // string | undefined — disk path under cacheKey
+await SvgaCache.size();                      // total bytes on disk
+await SvgaCache.count();                     // total entries on disk
+SvgaCache.setLimit(50 * 1024 * 1024);        // disk bytes; LRU evicts to fit
+SvgaCache.setMemoryLimit(16 * 1024 * 1024);  // in-memory decoded-entity bytes
+SvgaCache.setMaxAgeMs(24 * 60 * 60 * 1000);  // TTL — stale entries miss + re-download
+await SvgaCache.evictExpired();              // sweep TTL-expired entries; returns count removed
+SvgaCache.clear();                           // wipes both disk and in-memory caches
 ```
 
-The disk cache lives under the platform cache directory (`Context.cacheDir/svga_cache` on Android, `Caches/svga_cache` on iOS). Files are SHA-256-keyed by URL, so the same source string maps to the same file across app launches and across devices.
+The disk cache lives under the platform cache directory (`Context.cacheDir/svga_cache` on Android, `Caches/svga_cache` on iOS). Files are SHA-256-keyed by `cacheKey` (which falls back to the URL when omitted), so the same key maps to the same file across launches and devices. When a write would exceed `setLimit`, the LRU policy evicts the least-recently-used entries first; entries older than `setMaxAgeMs` are treated as misses on read and reaped by `evictExpired()`.
+
+The `<SvgaPlayer>` component takes the same `cacheKey` prop:
+
+```tsx
+<SvgaPlayer
+  source="https://cdn.example/gift-2.svga"
+  cacheKey="g2-v3"
+  loops={2}
+/>
+```
+
+Bumping `cacheKey` triggers a fresh download under the new key while still serving the URL.
 
 ### Styling and layout
 

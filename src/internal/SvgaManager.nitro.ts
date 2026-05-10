@@ -4,14 +4,21 @@ export interface SvgaManager extends HybridObject<{
   ios: 'swift';
   android: 'kotlin';
 }> {
-  preload(urls: string[]): Promise<void>;
-  preloadDecoded(urls: string[]): Promise<void>;
-  isCached(url: string): boolean;
-  getCachePath(url: string): string | undefined;
+  // `cacheKeys[i]` is the identity used for cache lookup/storage; download
+  // bytes still come from `urls[i]`. Pass an empty string to fall back to the
+  // url. Arrays must have the same length — the JS layer enforces this.
+  preload(urls: string[], cacheKeys: string[]): Promise<void>;
+  preloadDecoded(urls: string[], cacheKeys: string[]): Promise<void>;
+  isCached(cacheKey: string): boolean;
+  getCachePath(cacheKey: string): string | undefined;
   clearCache(): void;
   getCacheSize(): Promise<number>;
+  getCacheCount(): Promise<number>;
   setCacheLimit(bytes: number): void;
   setMemoryLimit(bytes: number): void;
+  // 0 disables TTL eviction (entries live until LRU evicts them).
+  setMaxAgeMs(ms: number): void;
+  evictExpired(): Promise<number>;
 
   // Extra sounds (not baked into svga bundle)
   loadSound(key: string, url: string): Promise<void>;

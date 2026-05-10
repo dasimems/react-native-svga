@@ -8,6 +8,11 @@ export type ScaleMode = 'fill' | 'aspectFit' | 'aspectFill';
 
 export interface SvgaProps extends HybridViewProps {
   source: string;
+  // Cache identity for the source. Empty string falls back to `source` so the
+  // existing string-only API keeps working. When this changes (with the same
+  // url), the player re-downloads under the new key — meaning content updates
+  // can be rolled out by bumping the key without changing the url.
+  cacheKey: string;
   loops: number;
   autoPlay: boolean;
   speed: number;

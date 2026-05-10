@@ -62,6 +62,7 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
   (props, ref) => {
     const {
       source,
+      cacheKey,
       loops = 0,
       autoPlay = true,
       speed = 1.0,
@@ -76,6 +77,10 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
       onLoop,
       onError,
     } = props;
+    // Normalise once at the JS boundary so the native side always receives a
+    // non-empty string. We pass `''` as the sentinel for "no override" — the
+    // native handler treats empty as "fall back to source".
+    const effectiveCacheKey = cacheKey ?? '';
 
     const SvgaView = useMemo(getSvgaView, []);
 
@@ -404,6 +409,7 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
       <SvgaView
         hybridRef={hybridRefProp}
         source={source}
+        cacheKey={effectiveCacheKey}
         loops={loops}
         autoPlay={autoPlay}
         speed={speed}

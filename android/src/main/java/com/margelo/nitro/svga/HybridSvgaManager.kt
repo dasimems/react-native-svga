@@ -29,25 +29,27 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
 
   init { SvgaMemoryCache.ensureInit(context) }
 
-  override fun preload(urls: Array<String>): Promise<Unit> {
+  override fun preload(urls: Array<String>, cacheKeys: Array<String>): Promise<Unit> {
     return Promise.async(scope) {
       coroutineScope {
-        urls.map { source ->
-          async { preloadGate.withPermit { preloadOne(source) } }
+        urls.mapIndexed { i, source ->
+          val key = effectiveKey(source, cacheKeys, i)
+          async { preloadGate.withPermit { preloadOne(source, key) } }
         }.awaitAll()
       }
       Unit
     }
   }
 
-  override fun preloadDecoded(urls: Array<String>): Promise<Unit> {
+  override fun preloadDecoded(urls: Array<String>, cacheKeys: Array<String>): Promise<Unit> {
     return Promise.async(scope) {
       // Best-effort warmup — failures don't fail the whole batch (one bad
       // URL shouldn't kill 100 valid preloads), but we log them so they're
       // not silently invisible. Previously this swallowed every Throwable
       // with no signal at all.
       coroutineScope {
-        urls.map { source ->
+        urls.mapIndexed { i, source ->
+          val key = effectiveKey(source, cacheKeys, i)
           async {
             preloadGate.withPermit {
               try {
@@ -55,7 +57,7 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
                 // the cache (which holds its own +1), so release ours
                 // immediately. Without this the entity bitmaps would
                 // never recycle until the JS context tore down.
-                SvgaSourceLoader.loadEntity(context, source).release()
+                SvgaSourceLoader.loadEntity(context, source, key).release()
               } catch (e: CancellationException) {
                 throw e
               } catch (t: Throwable) {
@@ -69,19 +71,21 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
     }
   }
 
-  override fun isCached(url: String): Boolean {
-    val resolved = UrlValidator.resolve(url) ?: return false
+  override fun isCached(cacheKey: String): Boolean {
+    val resolved = UrlValidator.resolve(cacheKey)
+      ?: return SvgaDiskCache.isCached(context, cacheKey)
     return when (resolved.kind) {
-      UrlValidator.Kind.REMOTE -> SvgaDiskCache.isCached(context, resolved.value)
+      UrlValidator.Kind.REMOTE -> SvgaDiskCache.isCached(context, cacheKey)
       UrlValidator.Kind.LOCAL_FILE -> java.io.File(resolved.value).isFile
       UrlValidator.Kind.BUNDLED_ASSET -> assetExists(resolved.value)
     }
   }
 
-  override fun getCachePath(url: String): String? {
-    val resolved = UrlValidator.resolve(url) ?: return null
+  override fun getCachePath(cacheKey: String): String? {
+    val resolved = UrlValidator.resolve(cacheKey)
+      ?: return SvgaDiskCache.pathOrNull(context, cacheKey)
     return when (resolved.kind) {
-      UrlValidator.Kind.REMOTE -> SvgaDiskCache.pathOrNull(context, resolved.value)
+      UrlValidator.Kind.REMOTE -> SvgaDiskCache.pathOrNull(context, cacheKey)
       UrlValidator.Kind.LOCAL_FILE -> java.io.File(resolved.value).takeIf { it.isFile }?.absolutePath
       UrlValidator.Kind.BUNDLED_ASSET -> if (assetExists(resolved.value)) resolved.value else null
     }
@@ -115,12 +119,38 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
     return Promise.async(scope) { SvgaDiskCache.totalSvgaBytes(context).toDouble() }
   }
 
+  override fun getCacheCount(): Promise<Double> {
+    return Promise.async(scope) { SvgaDiskCache.totalSvgaCount(context).toDouble() }
+  }
+
   override fun setCacheLimit(bytes: Double) {
-    SvgaDiskCache.setMaxBytes(bytes.toLong())
+    SvgaDiskCache.setMaxBytes(clampToLong(bytes))
   }
 
   override fun setMemoryLimit(bytes: Double) {
-    SvgaMemoryCache.setMaxBytes(bytes.toLong())
+    SvgaMemoryCache.setMaxBytes(clampToLong(bytes))
+  }
+
+  override fun setMaxAgeMs(ms: Double) {
+    val safe = clampToLong(ms)
+    // Mirror to both layers so a hit at either level honours the TTL.
+    SvgaDiskCache.setMaxAgeMs(safe)
+    SvgaMemoryCache.setMaxAgeMs(safe)
+  }
+
+  /// Defensive clamp against `NaN`/`Infinity`/negative `Double`s. The JS
+  /// `assertNonNegativeFinite` guard catches misuse at the package boundary,
+  /// but a non-Nitro caller reaching this spec from another module would
+  /// otherwise overflow into `Long.MIN_VALUE` (NaN.toLong() returns 0; +Inf
+  /// returns Long.MAX_VALUE on JVM, but defensive code reads cleaner).
+  private fun clampToLong(value: Double): Long {
+    if (value.isNaN() || value <= 0.0) return 0L
+    if (value >= Long.MAX_VALUE.toDouble()) return Long.MAX_VALUE
+    return value.toLong()
+  }
+
+  override fun evictExpired(): Promise<Double> {
+    return Promise.async(scope) { SvgaDiskCache.evictExpired(context).toDouble() }
   }
 
   override fun loadSound(key: String, url: String): Promise<Unit> {
@@ -143,10 +173,18 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
     sounds.release()
   }
 
-  private suspend fun preloadOne(source: String) {
+  /// Pick the effective cache key from `cacheKeys[i]`, falling back to the
+  /// URL when the JS layer didn't supply one (or the array is short — defend
+  /// against malformed callers).
+  private fun effectiveKey(url: String, cacheKeys: Array<String>, i: Int): String {
+    val raw = if (i < cacheKeys.size) cacheKeys[i] else ""
+    return if (raw.isNotEmpty()) raw else url
+  }
+
+  private suspend fun preloadOne(source: String, cacheKey: String) {
     val resolved = UrlValidator.resolve(source) ?: return
     if (resolved.kind != UrlValidator.Kind.REMOTE) return
-    SvgaSourceLoader.preloadRemote(context, resolved.value)
+    SvgaSourceLoader.preloadRemote(context, resolved.value, cacheKey)
   }
 
   companion object {
