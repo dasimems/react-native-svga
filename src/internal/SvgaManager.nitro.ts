@@ -7,7 +7,7 @@ export interface SvgaManager extends HybridObject<{
   preload(urls: string[]): Promise<void>;
   preloadDecoded(urls: string[]): Promise<void>;
   isCached(url: string): boolean;
-  getCachePath(url: string): string | null;
+  getCachePath(url: string): string | undefined;
   clearCache(): void;
   getCacheSize(): Promise<number>;
   setCacheLimit(bytes: number): void;

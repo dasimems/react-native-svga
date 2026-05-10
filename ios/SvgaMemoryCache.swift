@@ -1,11 +1,17 @@
 import Foundation
+import os
 
 internal final class SvgaMemoryCache {
 
     static let shared = SvgaMemoryCache()
 
     private let cache = NSCache<NSString, CachedEntity>()
-    private var explicitLimit: Int?
+    /// Guards `setMaxBytes` and the `put`-time read of `cache.totalCostLimit`.
+    /// NSCache itself is internally synchronised, but the gating compare in
+    /// `put` (skip when limit == 0) and the matched read+write in
+    /// `setMaxBytes` need to be serialised against the new concurrent
+    /// `parseQueue` workers that all funnel into `put`.
+    private let lock = os_unfair_lock_t.allocate(capacity: 1)
 
     private final class CachedEntity {
         let entity: SvgaEntity
@@ -13,12 +19,20 @@ internal final class SvgaMemoryCache {
     }
 
     init() {
+        lock.initialize(to: os_unfair_lock())
         cache.totalCostLimit = Self.defaultLimit()
     }
 
+    deinit {
+        lock.deinitialize(count: 1)
+        lock.deallocate()
+    }
+
     func setMaxBytes(_ bytes: Int) {
-        explicitLimit = max(0, bytes)
-        cache.totalCostLimit = max(0, bytes)
+        let safe = max(0, bytes)
+        os_unfair_lock_lock(lock)
+        cache.totalCostLimit = safe
+        os_unfair_lock_unlock(lock)
     }
 
     func get(_ key: String) -> SvgaEntity? {
@@ -26,7 +40,10 @@ internal final class SvgaMemoryCache {
     }
 
     func put(_ key: String, _ entity: SvgaEntity) {
-        if cache.totalCostLimit <= 0 { return }
+        os_unfair_lock_lock(lock)
+        let limit = cache.totalCostLimit
+        os_unfair_lock_unlock(lock)
+        if limit <= 0 { return }
         let cost = max(1, entity.byteSize)
         cache.setObject(CachedEntity(entity), forKey: key as NSString, cost: cost)
     }

@@ -27,7 +27,18 @@ final class HybridSvga: HybridSvgaSpec {
     /// ordering with prior calls.
     private func runOnMain(_ work: @escaping () -> Void) {
         if disposed { return }
-        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
+        if Thread.isMainThread {
+            // Re-check disposed inside main as well — disposed could flip
+            // between our outer check and the closure body if something else
+            // disposed us via main-thread re-entry.
+            if disposed { return }
+            work()
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, !self.disposed else { return }
+                work()
+            }
+        }
     }
 
     var source: String = "" {
@@ -88,23 +99,30 @@ final class HybridSvga: HybridSvgaSpec {
 
     override init() {
         super.init()
+        // Every listener gates on `disposed` because they can fire after the
+        // user-side `dispose()` has been issued but before the async cleanup
+        // closure runs on main — we must not poke UIKit/audio in that window.
         playerView.onFrame = { [weak self] frame, _ in
-            self?.audio.onFrame(frame)
+            guard let self = self, !self.disposed else { return }
+            self.audio.onFrame(frame)
         }
         playerView.onLoop = { [weak self] count in
-            self?.onLoop?(Double(count))
+            guard let self = self, !self.disposed else { return }
+            self.onLoop?(Double(count))
         }
         playerView.onFinish = { [weak self] in
-            self?.audio.stopAll()
-            self?.onFinish?()
+            guard let self = self, !self.disposed else { return }
+            self.audio.stopAll()
+            self.onFinish?()
         }
         playerView.onWindowVisibilityChange = { [weak self] visible in
-            guard let self = self else { return }
+            guard let self = self, !self.disposed else { return }
             if self.playInBackground { return }
             if visible { self.handleWindowReturned() } else { self.handleWindowGone() }
         }
         audio.onAudioError = { [weak self] message in
-            self?.onError?(message)
+            guard let self = self, !self.disposed else { return }
+            self.onError?(message)
         }
     }
 
@@ -184,18 +202,36 @@ final class HybridSvga: HybridSvgaSpec {
         // JS-side eager cleanup. SvgaPlayer.tsx unmount calls this so we
         // don't wait for JS GC to reclaim the handle. Idempotent — also
         // safe to call from deinit if dispose was never invoked.
+        //
+        // Critical: do NOT use `DispatchQueue.main.sync` here. Nitro can
+        // call dispose() on the JS thread while main is mid-bridge into JS
+        // (e.g. invoking onError/onFinish), which would deadlock. Capture
+        // local copies of the state we need so the async cleanup closure
+        // doesn't depend on `self` being alive — that lets dispose() be
+        // called safely from `deinit` too.
         if disposed { return }
         disposed = true
-        let cleanup = { [self] in
-            if let active = self.activeSource, self.activeLoadId != 0 {
-                SvgaSourceLoader.cancelLoad(active, callbackId: self.activeLoadId)
-                self.activeLoadId = 0
+        let pv = playerView
+        let au = audio
+        let capturedSource = activeSource
+        let capturedLoadId = activeLoadId
+        activeSource = nil
+        activeLoadId = 0
+        // Bump loadToken so a load completion that lands between here and
+        // cleanup running on main is dropped by its token check.
+        loadToken &+= 1
+        let cleanup: () -> Void = {
+            if let active = capturedSource, capturedLoadId != 0 {
+                SvgaSourceLoader.cancelLoad(active, callbackId: capturedLoadId)
             }
-            self.activeSource = nil
-            self.playerView.release()
-            self.audio.release()
+            pv.release()
+            au.release()
         }
-        if Thread.isMainThread { cleanup() } else { DispatchQueue.main.sync(execute: cleanup) }
+        if Thread.isMainThread {
+            cleanup()
+        } else {
+            DispatchQueue.main.async(execute: cleanup)
+        }
     }
 
     deinit {
@@ -207,7 +243,7 @@ final class HybridSvga: HybridSvgaSpec {
             SvgaSourceLoader.cancelLoad(previous, callbackId: activeLoadId)
         }
         activeLoadId = 0
-        loadToken += 1
+        loadToken &+= 1
         let token = loadToken
         pendingPlayOnLoad = false
         wasPlayingBeforeWindowGone = false
@@ -217,26 +253,42 @@ final class HybridSvga: HybridSvgaSpec {
             entityRef = nil
             playerView.stop()
             playerView.entity = nil
-            audio.stopAll()
+            // Tear down the prior load's audio tracks too. Without this
+            // the previous SVGA's AVAudioPlayers stay in memory until the
+            // next non-empty source loads (or dispose).
+            audio.unloadAll()
             return
         }
         activeSource = value
         activeLoadId = SvgaSourceLoader.loadEntity(value) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if token != self.loadToken { return }
-                self.activeLoadId = 0
-                switch result {
-                case .failure(let error):
+            // The loader fires this callback off-main (parse queue or URL
+            // session). Decode audio here, BEFORE the main hop, so by the
+            // time `applyEntity` runs and `play()` triggers `onFrame(0)`,
+            // the AVAudioPlayer instances are prepared and play immediately
+            // — without this the prior path used `decodeQueue.async` +
+            // a separate main hop, leaving a 10-50ms window where video had
+            // started but audio had not.
+            switch result {
+            case .failure(let error):
+                DispatchQueue.main.async {
+                    guard let self = self, !self.disposed else { return }
+                    if token != self.loadToken { return }
+                    self.activeLoadId = 0
                     self.onError?(error.localizedDescription)
-                case .success(let entity):
-                    self.applyEntity(entity)
+                }
+            case .success(let entity):
+                let preparedAudio = SvgaAudioEngine.prepareTracks(entity)
+                DispatchQueue.main.async {
+                    guard let self = self, !self.disposed else { return }
+                    if token != self.loadToken { return }
+                    self.activeLoadId = 0
+                    self.applyEntity(entity, preparedAudio: preparedAudio)
                 }
             }
         }
     }
 
-    private func applyEntity(_ entity: SvgaEntity) {
+    private func applyEntity(_ entity: SvgaEntity, preparedAudio: [SvgaAudioEngine.PreparedTrack]) {
         entityRef = entity
         playerView.entity = entity
         playerView.scaleMode = scaleMode
@@ -244,7 +296,7 @@ final class HybridSvga: HybridSvgaSpec {
         audio.setMuted(muteBuiltInAudio)
         audio.setVolume(Float(builtInAudioVolume))
         audio.setRate(Float(speed))
-        audio.load(entity)
+        audio.installTracks(preparedAudio)
         if userPaused {
             pendingPlayOnLoad = false
             return

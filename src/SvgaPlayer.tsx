@@ -30,14 +30,23 @@ type SvgaHostComponent = ReturnType<
   typeof getHostComponent<SvgaProps, SvgaMethods>
 >;
 let cachedSvgaView: SvgaHostComponent | null = null;
+let cachedSvgaViewError: unknown = null;
 const getSvgaView = (): SvgaHostComponent => {
   if (cachedSvgaView) return cachedSvgaView;
-  const SvgaConfig = require('../nitrogen/generated/shared/json/SvgaConfig.json');
-  cachedSvgaView = getHostComponent<SvgaProps, SvgaMethods>(
-    'Svga',
-    () => SvgaConfig
-  );
-  return cachedSvgaView;
+  // Cache the failure so an error boundary that retries doesn't keep
+  // re-running the (expensive, side-effecting) require.
+  if (cachedSvgaViewError) throw cachedSvgaViewError;
+  try {
+    const SvgaConfig = require('../nitrogen/generated/shared/json/SvgaConfig.json');
+    cachedSvgaView = getHostComponent<SvgaProps, SvgaMethods>(
+      'Svga',
+      () => SvgaConfig
+    );
+    return cachedSvgaView;
+  } catch (e) {
+    cachedSvgaViewError = e;
+    throw e;
+  }
 };
 
 const noopHandle = (): void => {
@@ -154,16 +163,62 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
     // order at the native side determines the final state.)
     const loadChainsRef = useRef<Map<string, Promise<void>>>(new Map());
 
+    // Mount/unmount fence. Declared BEFORE the sound-diff effect so its
+    // setup runs first on every commit (React runs effect setups in
+    // declaration order). That means `mountedRef.current = true` is set
+    // before the diff effect's body executes, even on Strict Mode's
+    // mount → unmount → re-mount dance where a stale `false` could
+    // otherwise be observed by the diff effect's first synchronous body.
+    // Cleanup runs in reverse, so on unmount the diff effect's cleanup
+    // (currently empty) runs first and then this effect flips to `false`
+    // before the native unloads — preserving the invariant that any
+    // in-flight load that resumes post-unmount sees `mountedRef.current`
+    // as `false`.
+    useEffect(() => {
+      mountedRef.current = true;
+      const loaded = loadedSoundsRef.current;
+      const chains = loadChainsRef.current;
+      return () => {
+        mountedRef.current = false;
+        for (const key of loaded.keys()) svgaManager.unloadSound(key);
+        loaded.clear();
+        // In-flight chain Promises will see !mountedRef and unload their
+        // own keys; clearing the map drops references so they can settle
+        // and be GC'd without blocking future remounts.
+        chains.clear();
+      };
+    }, []);
+
     useEffect(() => {
       const loaded = loadedSoundsRef.current;
       const chains = loadChainsRef.current;
       const desiredByKey = new Map(namespacedSounds.map((s) => [s.key, s]));
 
-      // Unload any key that's no longer in the desired set, or whose URL changed.
+      // Unload any key that's no longer in the desired set, or whose URL
+      // changed. If a load for the same key is still in flight, chain the
+      // unload AFTER it completes — without this, the native SoundLibrary
+      // can end up with a stale entry when a slow load resolves AFTER our
+      // unload (the native side swaps by sourcePath, so call order
+      // determines the final state).
       for (const [key, prevUrl] of Array.from(loaded.entries())) {
         const desired = desiredByKey.get(key);
         if (!desired || desired.url !== prevUrl) {
-          svgaManager.unloadSound(key);
+          const prior = chains.get(key);
+          if (prior) {
+            const after = prior
+              .catch(() => undefined)
+              .then(() => {
+                svgaManager.unloadSound(key);
+              });
+            chains.set(key, after);
+            // Drop our chain entry once the unload settles, but only if
+            // we're still the head (a newer load may have queued behind).
+            after.finally(() => {
+              if (chains.get(key) === after) chains.delete(key);
+            });
+          } else {
+            svgaManager.unloadSound(key);
+          }
           loaded.delete(key);
         }
       }
@@ -225,26 +280,6 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
       return undefined;
     }, [namespacedSounds]);
 
-    // Unload everything we loaded when the component unmounts. This effect
-    // intentionally has empty deps so its cleanup fires only on unmount;
-    // the diffed effect above doesn't clean up on its own teardown.
-    // mountedRef is reset on each setup so React Strict Mode's
-    // mount → unmount → re-mount dance leaves us in a healthy state.
-    useEffect(() => {
-      mountedRef.current = true;
-      const loaded = loadedSoundsRef.current;
-      const chains = loadChainsRef.current;
-      return () => {
-        mountedRef.current = false;
-        for (const key of loaded.keys()) svgaManager.unloadSound(key);
-        loaded.clear();
-        // In-flight chain Promises will see !mountedRef and unload their
-        // own keys; clearing the map drops references so they can settle
-        // and be GC'd without blocking future remounts.
-        chains.clear();
-      };
-    }, []);
-
     const wasPlayingForBgRef = useRef(false);
 
     useEffect(() => {
@@ -302,15 +337,13 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
       };
     }, []);
 
-    // Tracks the source we've handed to native. Used to filter onStart/
-    // onFinish callbacks and gate sound triggers when a load is still
-    // in flight, so audio from the old source can't fire over frames of
-    // the new one.
-    const activeSourceRef = useRef(source);
-    useEffect(() => {
-      activeSourceRef.current = source;
-    }, [source]);
-
+    // Returns true iff the named sound was loaded for the URL the player
+    // currently expects. This is enough to gate trigger-sound playback
+    // across rapid `source`/`sounds` changes: the prior source's sounds are
+    // unloaded before the new ones are loaded, so a late frame callback
+    // from the prior source sees `loaded.get(key) === undefined` (or a
+    // different URL) and skips. We do NOT need a separate source-token
+    // because the same diff effect drives both unload-old and load-new.
     const isSoundLoaded = useCallback((s: NamespacedSound) => {
       return loadedSoundsRef.current.get(s.key) === s.url;
     }, []);
@@ -352,6 +385,11 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
       hybridRef.current = value;
     }, []);
 
+    // Memoize the host-view ref-wrapper. A fresh literal every render makes
+    // the host component non-shallow-equal and may cause Nitro to re-bind
+    // its JSI handle on every parent re-render.
+    const hybridRefProp = useMemo(() => ({ f: captureRef }), [captureRef]);
+
     const eventHandlers = useMemo(
       () => ({
         onStart: { f: handleStart },
@@ -364,7 +402,7 @@ const SvgaPlayerInner = forwardRef<SvgaPlayerHandle, SvgaPlayerProps>(
 
     return (
       <SvgaView
-        hybridRef={{ f: captureRef }}
+        hybridRef={hybridRefProp}
         source={source}
         loops={loops}
         autoPlay={autoPlay}

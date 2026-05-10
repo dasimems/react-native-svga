@@ -59,9 +59,15 @@ internal final class SvgaSoundLibrary {
     }
 
     func release() {
-        queue.sync {
-            tracks.values.forEach { $0.player.stop() }
-            tracks.removeAll()
+        // Async so we can't block the calling thread (typically main during
+        // unmount, where a `.sync` here would block on any in-flight
+        // `play`/`stop` already serialised on `queue`). Order is preserved
+        // because `queue` is serial — release fires after every previously
+        // enqueued operation.
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            self.tracks.values.forEach { $0.player.stop() }
+            self.tracks.removeAll()
         }
     }
 }

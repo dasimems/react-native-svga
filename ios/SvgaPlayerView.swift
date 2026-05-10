@@ -13,11 +13,17 @@ internal final class SvgaPlayerView: UIView {
         didSet {
             reset()
             hasRendered = false
-            if entity == nil {
-                isPlaying = false
-                displayLink?.invalidate()
-                displayLink = nil
-            }
+            // Always invalidate the prior link on entity assignment. The
+            // common path (start → pause/stop → start) already handles this,
+            // but a direct entity swap that doesn't go through pause()/start()
+            // would otherwise leave the old link ticking against the new
+            // entity's state. Subsequent `start()` will create a fresh one.
+            // SvgaEntity is a struct so we can't cheaply test identity;
+            // unconditionally invalidating is fine — it's idempotent and
+            // cheap.
+            displayLink?.invalidate()
+            displayLink = nil
+            isPlaying = false
             setNeedsDisplay()
         }
     }

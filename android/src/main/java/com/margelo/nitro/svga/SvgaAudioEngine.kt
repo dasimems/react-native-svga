@@ -15,51 +15,63 @@ import java.io.File
  * frame loop in `SvgaPlayerView`.
  *
  * Threading contract:
- *  - All public methods are expected to be called from the main thread
- *    (HybridSvga calls them from main, applyEntity is on main).
- *  - `MediaPlayer.OnPreparedListener` and `OnErrorListener` callbacks fire
- *    on a non-main "media" thread. Track state mutated from those callbacks
- *    (`prepared`, `pendingStart`, `released`) is `@Volatile` to publish
- *    updates safely. All `tracks`-list access (the list itself, not its
- *    elements' fields) is wrapped in `synchronized(tracksLock)` because the
- *    OnPreparedListener can mutate-adjacent state while `unload`/`load` is
- *    iterating; we snapshot before iterating where possible.
+ *  - `prepareTracks(entity)` is called off the main thread (the entity-load
+ *    coroutine in `HybridSvga`). It does the synchronous `MediaPlayer.prepare()`
+ *    so that by the time tracks are installed, they're ready to play.
+ *  - `installTracks` and every other public method run on the main thread.
+ *  - `MediaPlayer.OnErrorListener` callbacks fire on the media thread.
+ *    Track state mutated from there is `@Volatile`. All `tracks`-list access
+ *    is wrapped in `synchronized(tracksLock)` because `unload()` may run on
+ *    any caller thread (e.g. `release()` from `dispose()` on JS thread).
  *  - The audio-error listener is dispatched to main via `mainHandler.post`
  *    so consumers always receive errors on a known thread.
  *
  * State machine (read by `onFrame`):
  *  - `muted == true`  → `onFrame` is a no-op (caller decided audio is off).
- *  - `paused == true` → `onFrame` is a no-op AND a `pendingStart` track that
- *    finishes preparing won't auto-start. Set by `pauseAll`/`stopAll`,
- *    cleared by `resumeAll`/`load`.
+ *  - `paused == true` → `onFrame` is a no-op. Set by `pauseAll`/`stopAll`,
+ *    cleared by `resumeAll`/`installTracks`.
  *  - Both clear → `onFrame` triggers `startTrack` at `startFrame` and
  *    `stopTrack` at `endFrame`.
- *  - `pendingStart` is set when a frame matches `startFrame` while a track is
- *    still preparing. The OnPreparedListener consumes the flag and starts
- *    the track only if `!muted && !paused && !released`.
  */
 internal class SvgaAudioEngine(private val context: Context) {
 
-  private class Track(
+  internal class Track(
     val player: MediaPlayer,
     val startFrame: Int,
     val endFrame: Int,
     val tempFile: File?,
     val source: BytesMediaDataSource?,
   ) {
+    /// Set true by `prepareOne` after `prepare()` succeeds. Public APIs that
+    /// touch the player gate on this — even though we now prepare
+    /// synchronously, `OnErrorListener` may flip it back to `false` if the
+    /// platform decoder fails after install.
     @Volatile var prepared: Boolean = false
-    @Volatile var pendingStart: Boolean = false
     /// Set by `unload()` before `player.release()`. Every code path that
     /// touches `player` must check this first — `MediaPlayer.setVolume` /
     /// `start` / `seekTo` on a released player throws IllegalStateException
     /// (and on some OEMs raises a fatal native abort).
     @Volatile var released: Boolean = false
+    /// Captured by `pauseAll()` from the live `isPlaying` state. `resumeAll()`
+    /// only restarts tracks where this flag is true, then clears it. This
+    /// is what distinguishes "was actively playing when we paused" from
+    /// "was already stopped past its endFrame" (which has currentPosition=0
+    /// after stopTrack's seekTo(0)) — without it, resumeAll would
+    /// incorrectly restart already-finished tracks on every background→
+    /// foreground cycle.
+    @Volatile var wasPlayingBeforePauseAll: Boolean = false
   }
 
   fun interface AudioErrorListener { fun onAudioError(message: String) }
 
   private val tracks = mutableListOf<Track>()
   private val tracksLock = Any()
+  // Tracks paused specifically by `setMuted(true)`. On `setMuted(false)` we
+  // restart these (subject to the global `paused` gate). Without this set,
+  // un-muting was a no-op for tracks that were mid-play when the mute fired:
+  // they stayed silent until the next animation loop hit their startFrame.
+  // Guarded by `tracksLock`.
+  private val mutePausedTracks = HashSet<Track>()
   private val mainHandler = Handler(Looper.getMainLooper())
   var onAudioError: AudioErrorListener? = null
 
@@ -71,13 +83,42 @@ internal class SvgaAudioEngine(private val context: Context) {
   private fun snapshotTracks(): List<Track> = synchronized(tracksLock) { tracks.toList() }
 
   fun setMuted(value: Boolean) {
+    if (muted == value) return
     muted = value
-    if (!value) return
-    for (track in snapshotTracks()) {
-      if (track.released || !track.prepared) continue
-      try {
-        if (track.player.isPlaying) track.player.pause()
-      } catch (_: IllegalStateException) {}
+    if (value) {
+      // Mute: pause anything mid-play and remember it so un-mute can restart.
+      for (track in snapshotTracks()) {
+        if (track.released || !track.prepared) continue
+        try {
+          if (track.player.isPlaying) {
+            track.player.pause()
+            synchronized(tracksLock) { mutePausedTracks.add(track) }
+          }
+        } catch (_: IllegalStateException) {}
+      }
+    } else {
+      // Un-mute: restart everything we paused, unless the engine is also
+      // globally paused (e.g. backgrounded). When engine-paused, transfer
+      // the mute-resume intent to the pauseAll-resume intent so resumeAll()
+      // will pick the tracks up later — without this transfer, if `mute(true)`
+      // was called BEFORE `pauseAll()`, those tracks would be silently
+      // stuck (pauseAll didn't see them as playing, so it didn't record
+      // them; mute path drops them at this `if (paused) return`).
+      val toResume: List<Track> = synchronized(tracksLock) {
+        val list = mutePausedTracks.toList()
+        mutePausedTracks.clear()
+        list
+      }
+      if (paused) {
+        for (track in toResume) {
+          if (!track.released) track.wasPlayingBeforePauseAll = true
+        }
+        return
+      }
+      for (track in toResume) {
+        if (track.released || !track.prepared) continue
+        try { track.player.start() } catch (_: IllegalStateException) {}
+      }
     }
   }
 
@@ -100,17 +141,76 @@ internal class SvgaAudioEngine(private val context: Context) {
     }
   }
 
-  fun load(entity: SvgaEntity) {
-    unload()
-    paused = false
-    if (entity.movie.audios.isEmpty()) return
-    val newTracks = ArrayList<Track>(entity.movie.audios.size)
+  /// Pre-decoded payload returned from `prepareTracks` and consumed by
+  /// `installTracks`. `error` carries a deferred failure message that
+  /// `installTracks` posts to `onAudioError` on main; `track` is null when
+  /// decode failed. Decoupling decode from install lets the host run the
+  /// expensive `prepare()` (synchronous) on the entity-load coroutine,
+  /// off main, so audio is ready to play the moment `onFrame(0)` fires.
+  internal class PreparedTrack(
+    val track: Track?,
+    val error: String?
+  )
+
+  /// Decodes + synchronously prepares MediaPlayer instances for every audio
+  /// track in `entity`. Must be called off the main thread — `prepare()`
+  /// blocks until the decoder is ready (typically a few ms for the local
+  /// in-memory data sources we use, but not main-thread safe).
+  fun prepareTracks(entity: SvgaEntity): List<PreparedTrack> {
+    if (entity.movie.audios.isEmpty()) return emptyList()
+    val out = ArrayList<PreparedTrack>(entity.movie.audios.size)
     for (audio in entity.movie.audios) {
       val bytes = entity.audioData[audio.audioKey] ?: continue
-      val track = newTrack(audio, bytes) ?: continue
+      out.add(prepareOne(audio, bytes))
+    }
+    return out
+  }
+
+  /// Release MediaPlayers from a `prepareTracks` result that never reached
+  /// `installTracks` — e.g. the load coroutine was cancelled, or the apply
+  /// step threw between prepare and install. Without this the host would
+  /// hold prepared MediaPlayers + temp files until JVM finalisation.
+  fun releasePrepared(prepared: List<PreparedTrack>) {
+    for (p in prepared) {
+      val track = p.track ?: continue
+      track.released = true
+      try {
+        track.player.setOnErrorListener(null)
+        track.player.reset()
+      } catch (_: Exception) {}
+      try { track.player.release() } catch (_: Exception) {}
+      track.source?.close()
+      track.tempFile?.delete()
+    }
+  }
+
+  /// Main-thread install. Replaces any previously-installed tracks
+  /// atomically with the pre-decoded set. Adopts engine-live volume/rate
+  /// so a setter issued mid-decode lands on the new tracks too.
+  fun installTracks(prepared: List<PreparedTrack>) {
+    unload()
+    paused = false
+    val newTracks = ArrayList<Track>(prepared.size)
+    for (p in prepared) {
+      val message = p.error
+      if (message != null) {
+        reportError(message)
+        continue
+      }
+      val track = p.track ?: continue
+      try {
+        track.player.setVolume(volume, volume)
+        applyRate(track)
+      } catch (_: IllegalStateException) {}
       newTracks.add(track)
     }
     synchronized(tracksLock) { tracks.addAll(newTracks) }
+  }
+
+  /// Convenience: decode + install in one call. Caller must be off main if
+  /// it cares about UI smoothness — `prepareTracks` blocks per track.
+  fun load(entity: SvgaEntity) {
+    installTracks(prepareTracks(entity))
   }
 
   fun onFrame(frame: Int) {
@@ -130,18 +230,41 @@ internal class SvgaAudioEngine(private val context: Context) {
     for (track in snapshotTracks()) {
       if (track.released || !track.prepared) continue
       try {
-        if (track.player.isPlaying) track.player.pause()
+        // Capture intent BEFORE pausing so resumeAll knows which tracks to
+        // restart. Anything that wasn't playing (already stopped past its
+        // endFrame, or hadn't started yet) stays out of the resume set.
+        if (track.player.isPlaying) {
+          track.wasPlayingBeforePauseAll = true
+          track.player.pause()
+        }
       } catch (_: IllegalStateException) {}
     }
   }
 
   fun resumeAll() {
     paused = false
-    if (muted) return
+    if (muted) {
+      // Engine is also muted — defer resume to the eventual setMuted(false)
+      // by promoting each track's pauseAll-resume intent into the
+      // mute-resume set. Without this transfer, the inverse-order scenario
+      // `pauseAll → mute → resumeAll → unmute` would silently drop the
+      // resume info: setMuted(true) couldn't have recorded these tracks
+      // because they were already paused-by-pauseAll when it ran, and
+      // resumeAll bails here on muted.
+      for (track in snapshotTracks()) {
+        if (!track.wasPlayingBeforePauseAll) continue
+        track.wasPlayingBeforePauseAll = false
+        if (track.released) continue
+        synchronized(tracksLock) { mutePausedTracks.add(track) }
+      }
+      return
+    }
     for (track in snapshotTracks()) {
       if (track.released || !track.prepared) continue
+      if (!track.wasPlayingBeforePauseAll) continue
+      track.wasPlayingBeforePauseAll = false
       try {
-        if (!track.player.isPlaying && track.player.currentPosition > 0) track.player.start()
+        if (!track.player.isPlaying) track.player.start()
       } catch (_: IllegalStateException) {}
     }
   }
@@ -149,6 +272,13 @@ internal class SvgaAudioEngine(private val context: Context) {
   fun stopAll() {
     paused = true
     for (track in snapshotTracks()) stopTrack(track)
+  }
+
+  /// Public counterpart to `unload()` so the host can drop the current
+  /// load's MediaPlayers without also tearing down the engine itself
+  /// (release()). Called when source is set to empty.
+  fun unloadAll() {
+    unload()
   }
 
   fun release() {
@@ -160,16 +290,18 @@ internal class SvgaAudioEngine(private val context: Context) {
     val toRelease: List<Track> = synchronized(tracksLock) {
       val copy = tracks.toList()
       tracks.clear()
+      // Drop any remembered mute-pause references — they all point at
+      // tracks we're about to release.
+      mutePausedTracks.clear()
       copy
     }
     for (track in toRelease) {
       // Mark released BEFORE clearing listeners + reset + release so any
-      // concurrent OnPreparedListener that fires after we null the listener
+      // concurrent OnErrorListener that fires after we null the listener
       // still sees the flag and short-circuits.
       track.released = true
       track.prepared = false
       try {
-        track.player.setOnPreparedListener(null)
         track.player.setOnErrorListener(null)
         track.player.reset()
       } catch (_: Exception) {}
@@ -179,7 +311,11 @@ internal class SvgaAudioEngine(private val context: Context) {
     }
   }
 
-  private fun newTrack(audio: AudioEntity, bytes: ByteArray): Track? {
+  /// Decodes + synchronously prepares one MediaPlayer for the given audio
+  /// track. Must be called off the main thread — `MediaPlayer.prepare()`
+  /// blocks (typically a few ms for the in-memory data sources we use, but
+  /// strict-mode would flag it on main).
+  private fun prepareOne(audio: AudioEntity, bytes: ByteArray): PreparedTrack {
     val player = MediaPlayer()
     player.setAudioAttributes(
       AudioAttributes.Builder()
@@ -201,57 +337,34 @@ internal class SvgaAudioEngine(private val context: Context) {
         player.setDataSource(tempFile.absolutePath)
       }
     } catch (e: Exception) {
-      reportError("audio source setup failed for ${audio.audioKey}: ${e.message}")
       try { player.release() } catch (_: Exception) {}
       dataSource?.close()
       tempFile?.delete()
-      return null
+      return PreparedTrack(null, "audio source setup failed for ${audio.audioKey}: ${e.message}")
     }
 
     val track = Track(player, audio.startFrame, audio.endFrame, tempFile, dataSource)
-    player.setOnPreparedListener {
-      // Listener fires on the media thread. Read the released flag (volatile)
-      // before doing anything else — `unload` may have started and the
-      // player may be unsafe to touch.
-      if (track.released) return@setOnPreparedListener
-      track.prepared = true
-      try {
-        player.setVolume(volume, volume)
-        applyRate(track)
-        if (track.pendingStart && !muted && !paused && !track.released) {
-          track.pendingStart = false
-          try {
-            player.seekTo(0)
-            player.start()
-          } catch (_: IllegalStateException) {}
-        } else {
-          track.pendingStart = false
-        }
-      } catch (_: IllegalStateException) {}
-    }
     player.setOnErrorListener { _, what, extra ->
       reportError("audio playback error for ${audio.audioKey} (what=$what extra=$extra)")
-      track.prepared = false
       true
     }
     try {
-      player.prepareAsync()
+      // Synchronous prepare. Safe for in-memory / on-disk sources; the
+      // caller is responsible for keeping us off main.
+      player.prepare()
     } catch (e: Exception) {
-      reportError("audio prepare failed for ${audio.audioKey}: ${e.message}")
       try { player.release() } catch (_: Exception) {}
       dataSource?.close()
       tempFile?.delete()
-      return null
+      return PreparedTrack(null, "audio prepare failed for ${audio.audioKey}: ${e.message}")
     }
-    return track
+    track.prepared = true
+    return PreparedTrack(track, null)
   }
 
   private fun startTrack(track: Track) {
     if (paused || track.released) return
-    if (!track.prepared) {
-      track.pendingStart = true
-      return
-    }
+    if (!track.prepared) return
     val player = track.player
     try {
       player.seekTo(0)
@@ -261,7 +374,9 @@ internal class SvgaAudioEngine(private val context: Context) {
   }
 
   private fun stopTrack(track: Track) {
-    track.pendingStart = false
+    // Stopping a track invalidates both resume intents (mute and pauseAll).
+    track.wasPlayingBeforePauseAll = false
+    synchronized(tracksLock) { mutePausedTracks.remove(track) }
     if (track.released || !track.prepared) return
     val player = track.player
     try {
@@ -292,7 +407,7 @@ internal class SvgaAudioEngine(private val context: Context) {
     mainHandler.post { listener.onAudioError(message) }
   }
 
-  private class BytesMediaDataSource(private val bytes: ByteArray) : MediaDataSource() {
+  internal class BytesMediaDataSource(private val bytes: ByteArray) : MediaDataSource() {
     override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
       if (position >= bytes.size) return -1
       val available = (bytes.size - position.toInt()).coerceAtMost(size)

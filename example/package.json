@@ -12,7 +12,7 @@
     "expo-status-bar": "~55.0.4",
     "react": "19.2.0",
     "react-native": "0.83.2",
-    "react-native-nitro-modules": "^0.29.8"
+    "react-native-nitro-modules": "^0.35.6"
   },
   "private": true,
   "devDependencies": {

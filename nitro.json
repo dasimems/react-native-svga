@@ -9,12 +9,12 @@
   },
   "autolinking": {
     "Svga": {
-      "swift": "HybridSvga",
-      "kotlin": "HybridSvga"
+      "ios": { "language": "swift", "implementationClassName": "HybridSvga" },
+      "android": { "language": "kotlin", "implementationClassName": "HybridSvga" }
     },
     "SvgaManager": {
-      "swift": "HybridSvgaManager",
-      "kotlin": "HybridSvgaManager"
+      "ios": { "language": "swift", "implementationClassName": "HybridSvgaManager" },
+      "android": { "language": "kotlin", "implementationClassName": "HybridSvgaManager" }
     }
   },
   "ignorePaths": ["node_modules"]

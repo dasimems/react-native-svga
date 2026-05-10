@@ -124,10 +124,12 @@ internal class SvgaPlayerView(context: Context) : View(context) {
   fun release() {
     handler.removeCallbacks(tick)
     playing = false
-    // Drop our entity reference so the cache (or any other holder) can
-    // reach refcount zero and recycle bitmaps. Going through the setter
-    // also clears the playing/render state.
-    entity = null
+    // NOTE: do NOT clear `entity` here. release() is invoked from
+    // onDetachedFromWindow, and RN re-attaches native views in scrollers,
+    // FlatLists, and navigation reuse. Clearing entity here would leave
+    // the view permanently blank on re-attach because there is no path
+    // that re-installs entity from the host. End-of-life entity drop
+    // happens in HybridSvga.dispose() instead.
   }
 
   override fun onDraw(canvas: Canvas) {
