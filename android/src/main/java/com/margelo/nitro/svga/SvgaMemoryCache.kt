@@ -124,15 +124,23 @@ internal object SvgaMemoryCache {
   /// staleness) can never observe a half-written state — either both the
   /// fresh stamp and fresh entity are visible, or neither is. Releases
   /// triggered by an LRU-trim during this put are deferred outside the lock.
+  ///
+  /// Over-sized entities are skipped entirely. Letting LruCache accept then
+  /// immediately evict them would trip `entryRemoved.release()` and recycle
+  /// the bitmaps before the loader's awaiter (`SvgaSourceLoader.loadEntity`
+  /// → `deferred.await().retain()`) gets a chance to retain — leaving every
+  /// caller with a zombie SvgaEntity whose `bitmap.isRecycled` short-circuits
+  /// every draw. The caller's retain on `entity` is unaffected because we
+  /// never bump the refcount on this path.
   fun put(key: String, entity: SvgaEntity) {
+    val cap = synchronized(this) { cache.maxSize() }
+    val entrySize = (entity.byteSize + ENTRY_HEADROOM)
+      .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+    if (entrySize > cap) return
     withDeferredReleases {
       synchronized(storedAt) {
         storedAt[key] = System.currentTimeMillis()
         // Cache holds its own +1; `entryRemoved` releases on eviction/replace.
-        // If the caller's `byteSize` exceeds `cache.maxSize()`, LruCache's
-        // post-put trim evicts the new entry immediately and `entryRemoved`
-        // balances our `retain()` — net effect is a no-op, which is what
-        // we want for an over-sized payload.
         cache.put(key, entity.retain())
       }
     }
