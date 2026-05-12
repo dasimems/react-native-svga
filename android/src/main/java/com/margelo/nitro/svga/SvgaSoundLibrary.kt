@@ -43,33 +43,44 @@ internal class SvgaSoundLibrary(private val context: Context) {
     }
   }
 
+  // play/stop/stopAll hold `loadLock` for the same reason `load`/`unload` do:
+  // a concurrent `unload` (or `release`) can call `MediaPlayer.release()` on
+  // the track while another caller is still inside `player.setVolume/seekTo/
+  // start`. The catch-IllegalStateException keeps us from crashing, but
+  // silently drops the sound. iOS sidesteps this by serialising every public
+  // method on a single dispatch queue; mirror that here so play/stop never
+  // race the player's lifecycle. ReentrantLock makes nested calls (e.g. test
+  // harnesses that call load→play synchronously) safe.
   fun play(key: String, volume: Float) {
-    val track = tracks[key] ?: return
-    val v = volume.coerceIn(0f, 1f)
-    val player = track.player
-    try {
-      player.setVolume(v, v)
-      player.seekTo(0)
-      player.start()
-    } catch (_: IllegalStateException) {}
+    loadLock.withLock {
+      val track = tracks[key] ?: return
+      val v = volume.coerceIn(0f, 1f)
+      try {
+        track.player.setVolume(v, v)
+        track.player.seekTo(0)
+        track.player.start()
+      } catch (_: IllegalStateException) {}
+    }
   }
 
   fun stop(key: String) {
-    val track = tracks[key] ?: return
-    val player = track.player
-    try {
-      if (player.isPlaying) player.pause()
-      player.seekTo(0)
-    } catch (_: IllegalStateException) {}
+    loadLock.withLock {
+      val track = tracks[key] ?: return
+      try {
+        if (track.player.isPlaying) track.player.pause()
+        track.player.seekTo(0)
+      } catch (_: IllegalStateException) {}
+    }
   }
 
   fun stopAll() {
-    for ((_, track) in tracks) {
-      val player = track.player
-      try {
-        if (player.isPlaying) player.pause()
-        player.seekTo(0)
-      } catch (_: IllegalStateException) {}
+    loadLock.withLock {
+      for ((_, track) in tracks) {
+        try {
+          if (track.player.isPlaying) track.player.pause()
+          track.player.seekTo(0)
+        } catch (_: IllegalStateException) {}
+      }
     }
   }
 
