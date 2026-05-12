@@ -151,6 +151,14 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     )
 
     canvas.save()
+    // Clip to view bounds so `aspectFill` (and any sprite with overflowing
+    // layout transforms) doesn't paint outside our rect. iOS gets this for
+    // free — UIView's draw(_:) context is bounds-clipped by the system —
+    // but on Android the canvas a custom View receives in onDraw inherits
+    // its clip from the parent, which is unbounded when the React Native
+    // host doesn't set `overflow: 'hidden'`. Without this, an aspectFill
+    // 496×864 source rendered into a 200×200 slot bleeds into siblings.
+    canvas.clipRect(0f, 0f, width.toFloat(), height.toFloat())
     canvas.translate(scale.translateX, scale.translateY)
     canvas.scale(scale.scaleX, scale.scaleY)
 
