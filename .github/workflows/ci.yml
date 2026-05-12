@@ -72,7 +72,10 @@ jobs:
           npm exec --workspace=react-native-svga-example -- expo prebuild --platform android
 
       - name: Run Android JUnit tests
-        run: cd example/android && ./gradlew :react-native-svga:test --no-daemon
+        # Expo autolinking derives the gradle project name from the package
+        # name, replacing `@` and `/` with `_`. The scope is hard-coded here;
+        # bump this if the package scope ever changes.
+        run: cd example/android && ./gradlew :dasimems_react-native-svga:test --no-daemon
 
   build-library:
     runs-on: ubuntu-latest
