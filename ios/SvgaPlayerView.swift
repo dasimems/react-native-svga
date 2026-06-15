@@ -2,6 +2,31 @@ import CoreGraphics
 import QuartzCore
 import UIKit
 
+/// SVGA renderer.
+///
+/// Rendering model — GPU compositing via a CALayer tree (NOT `draw(rect:)`):
+/// every sprite gets its own `CALayer` whose `contents` is the sprite's
+/// pre-decoded `CGImage`, set ONCE when the entity is installed. Per frame we
+/// only mutate each sublayer's `transform` / `opacity` / `isHidden` — a handful
+/// of float writes that Core Animation composites on the GPU. The expensive
+/// part (rasterizing pixels) never touches the CPU or the main thread after the
+/// initial texture upload.
+///
+/// This replaces an earlier `UIView.draw(rect:)` + `UIGraphicsGetCurrentContext`
+/// implementation, which was pure Quartz software rasterization on the main
+/// thread: every frame it allocated a view-sized (full-screen, at retina scale)
+/// bitmap, CPU-drew every sprite into it, and re-uploaded it. For a long-running,
+/// full-screen, looping animation that pegged the CPU and heated the SoC until
+/// iOS thermally throttled the whole app. Android never had this because
+/// `View.onDraw`'s canvas is hardware-accelerated — this brings iOS to parity.
+///
+/// Geometry: every sprite layer (and the math below) uses `anchorPoint = (0,0)`
+/// and `position = (0,0)`. With those, a CALayer's `transform` acts as a pure
+/// linear map from the layer's local space to the superlayer's — i.e. it
+/// behaves exactly like a `CGContext` CTM concatenation, so the affine math
+/// matches the old Core Graphics path 1:1. Image orientation is handled by
+/// Core Animation (contents draw upright, top-left origin), so the per-image
+/// y-flip the old `draw(rect:)` needed is gone.
 internal final class SvgaPlayerView: UIView {
 
     typealias FrameHandler = (Int, Bool) -> Void
@@ -24,11 +49,22 @@ internal final class SvgaPlayerView: UIView {
             displayLink?.invalidate()
             displayLink = nil
             isPlaying = false
-            setNeedsDisplay()
+            // Tear down the old sprite layers and build one per sprite for the
+            // new entity (textures uploaded here, once). Then show frame 0 so a
+            // freshly-installed-but-not-yet-playing entity is visible, matching
+            // the old `setNeedsDisplay()` behaviour.
+            rebuildLayers()
+            updateOuterTransform()
+            applyFrame(currentFrame)
         }
     }
 
-    var scaleMode: ScaleMode = .aspectfit { didSet { setNeedsDisplay() } }
+    var scaleMode: ScaleMode = .aspectfit {
+        didSet {
+            updateOuterTransform()
+            applyFrame(currentFrame)
+        }
+    }
     var maxLoops: Int = 0
     var frameInterval: TimeInterval = 1.0 / 15.0
 
@@ -45,11 +81,18 @@ internal final class SvgaPlayerView: UIView {
     private var displayLink: CADisplayLink?
     private var lastTickAt: CFTimeInterval = 0
 
+    /// One layer per `movie.sprites` entry, in source (z) order. Parallel to
+    /// `entity.movie.sprites` — index i here renders sprite i.
+    private var spriteLayers: [CALayer] = []
+    /// viewBox → view-space map (the aspect-fit/fill scale + centering). Baked
+    /// into each sprite's per-frame transform; recomputed on layout/scaleMode
+    /// change, not per frame.
+    private var outerTransform: CGAffineTransform = .identity
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         isOpaque = false
-        contentMode = .redraw
         layer.isGeometryFlipped = false
     }
 
@@ -65,6 +108,16 @@ internal final class SvgaPlayerView: UIView {
         onWindowVisibilityChange?(window != nil)
     }
 
+    // The outer transform depends on our bounds (aspect-fit/fill centering), so
+    // recompute whenever the host resizes us — including the first real layout
+    // pass after an entity is installed while bounds were still zero. Re-apply
+    // the current frame so the new mapping takes effect even while paused.
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        updateOuterTransform()
+        applyFrame(currentFrame)
+    }
+
     func start() {
         if isPlaying { return }
         if entity == nil { return }
@@ -73,7 +126,7 @@ internal final class SvgaPlayerView: UIView {
         if !hasRendered {
             hasRendered = true
             onFrame?(currentFrame, false)
-            setNeedsDisplay()
+            applyFrame(currentFrame)
         }
         // Defensive: if a previous start() left a link attached (e.g. an
         // entity swap that didn't go through pause()), invalidate it before
@@ -108,14 +161,14 @@ internal final class SvgaPlayerView: UIView {
         displayLink?.invalidate()
         displayLink = nil
         reset()
-        setNeedsDisplay()
+        applyFrame(currentFrame)
     }
 
     func seekToFrame(_ frame: Int) {
         guard let total = entity?.movie.frames, total > 0 else { return }
         currentFrame = max(0, min(total - 1, frame))
         if isPlaying { onFrame?(currentFrame, false) }
-        setNeedsDisplay()
+        applyFrame(currentFrame)
     }
 
     func release() {
@@ -131,12 +184,13 @@ internal final class SvgaPlayerView: UIView {
         advance()
     }
 
-    override func draw(_ rect: CGRect) {
-        guard let ctx = UIGraphicsGetCurrentContext() else { return }
-        guard let e = entity else { return }
-        let movie = e.movie
-        if movie.frames <= 0 { return }
-
+    /// Recompute the viewBox → view-space map from the current bounds and
+    /// scaleMode. Cheap; safe to call when there's no entity (identity).
+    private func updateOuterTransform() {
+        guard let movie = entity?.movie else {
+            outerTransform = .identity
+            return
+        }
         let scale = ScaleCalc.compute(
             mode: scaleMode,
             viewWidth: bounds.width,
@@ -144,34 +198,79 @@ internal final class SvgaPlayerView: UIView {
             contentWidth: movie.viewBoxWidth,
             contentHeight: movie.viewBoxHeight
         )
-
-        ctx.saveGState()
-        ctx.translateBy(x: scale.translateX, y: scale.translateY)
-        ctx.scaleBy(x: scale.scaleX, y: scale.scaleY)
-
-        for sprite in movie.sprites {
-            drawSprite(ctx: ctx, sprite: sprite, entity: e)
-        }
-        ctx.restoreGState()
+        // Order mirrors the old CTM exactly: a content point is mapped by the
+        // sprite's frame transform first, THEN scaled, THEN translated. The
+        // (scale → translate) tail is `ScaleResult.transform`; the frame
+        // transform is pre-multiplied per sprite in `applyFrame`.
+        outerTransform = scale.transform
     }
 
-    private func drawSprite(ctx: CGContext, sprite: SpriteEntity, entity: SvgaEntity) {
-        let frames = sprite.frames
-        if currentFrame >= frames.count { return }
-        let frame = frames[currentFrame]
-        if !frame.hasContent || frame.alpha <= 0 { return }
-        guard let image = entity.images[sprite.imageKey] else { return }
-        let bw = CGFloat(image.width)
-        let bh = CGFloat(image.height)
-        if bw <= 0 || bh <= 0 { return }
+    /// Discard the current sprite layers and build a fresh one per sprite for
+    /// the installed entity. Each layer's `contents` (the decoded CGImage) is
+    /// assigned once here — the only texture upload in the whole render loop.
+    private func rebuildLayers() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for l in spriteLayers { l.removeFromSuperlayer() }
+        spriteLayers.removeAll(keepingCapacity: true)
+        if let e = entity {
+            for sprite in e.movie.sprites {
+                let l = CALayer()
+                l.anchorPoint = .zero
+                l.position = .zero
+                l.contentsGravity = .resize
+                l.allowsEdgeAntialiasing = true
+                // Start hidden; applyFrame reveals only the sprites whose
+                // current frame has content.
+                l.isHidden = true
+                if let img = e.images[sprite.imageKey] {
+                    l.contents = img
+                    // Bounds in the image's pixel units (treated as points in
+                    // local space) — the per-frame affine, which already carries
+                    // the bitmap→layout scale from `composeTransforms`, sizes it.
+                    l.bounds = CGRect(x: 0, y: 0, width: CGFloat(img.width), height: CGFloat(img.height))
+                }
+                layer.addSublayer(l)
+                spriteLayers.append(l)
+            }
+        }
+        CATransaction.commit()
+    }
 
-        ctx.saveGState()
-        ctx.setAlpha(frame.alpha)
-        ctx.concatenate(frame.transform)
-        ctx.translateBy(x: 0, y: bh)
-        ctx.scaleBy(x: 1, y: -1)
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: bw, height: bh))
-        ctx.restoreGState()
+    /// Push frame `index` to the layer tree: for each sprite, set visibility,
+    /// opacity, and the composed affine (frame transform → outer transform).
+    /// Wrapped in a no-implicit-animation transaction so each frame is a hard
+    /// cut, not a quarter-second tween — without this every property change
+    /// would animate, smearing frames and adding compositor work.
+    private func applyFrame(_ index: Int) {
+        guard let movie = entity?.movie, movie.frames > 0 else { return }
+        // Defensive: layers and sprites must stay in lockstep. If a rebuild is
+        // mid-flight (shouldn't happen on main, but cheap to guard), skip.
+        if spriteLayers.count != movie.sprites.count { return }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (i, sprite) in movie.sprites.enumerated() {
+            let l = spriteLayers[i]
+            let frames = sprite.frames
+            // Sprite shorter than the timeline, no content this frame, fully
+            // transparent, or no image → nothing to show.
+            if index < 0 || index >= frames.count || l.contents == nil {
+                l.isHidden = true
+                continue
+            }
+            let frame = frames[index]
+            if !frame.hasContent || frame.alpha <= 0 {
+                l.isHidden = true
+                continue
+            }
+            l.isHidden = false
+            l.opacity = Float(frame.alpha)
+            // frame.transform first, then the viewBox→view map — matches the
+            // old `concatenate(frame.transform)` after the CTM scale/translate.
+            l.setAffineTransform(frame.transform.concatenating(outerTransform))
+        }
+        CATransaction.commit()
     }
 
     private func reset() {
@@ -195,7 +294,7 @@ internal final class SvgaPlayerView: UIView {
                 isPlaying = false
                 displayLink?.invalidate()
                 displayLink = nil
-                setNeedsDisplay()
+                applyFrame(currentFrame)
                 onFinish?()
                 return
             }
@@ -204,7 +303,7 @@ internal final class SvgaPlayerView: UIView {
         }
 
         onFrame?(currentFrame, isLast)
-        setNeedsDisplay()
+        applyFrame(currentFrame)
     }
 }
 

@@ -5,6 +5,17 @@ internal struct ScaleResult {
     let scaleY: CGFloat
     let translateX: CGFloat
     let translateY: CGFloat
+
+    /// The viewBox → view-space affine: a content point is scaled, then
+    /// translated (centering offset). `a.concatenating(b)` applies `a` then
+    /// `b`, so this is scale-then-translate. The renderer pre-multiplies each
+    /// sprite's frame transform onto this (`frame.transform.concatenating(.)`),
+    /// reproducing the old `draw(rect:)` CTM order exactly. Kept here as the
+    /// single source of truth so `SvgaPlayerView` and its tests agree.
+    var transform: CGAffineTransform {
+        return CGAffineTransform(scaleX: scaleX, y: scaleY)
+            .concatenating(CGAffineTransform(translationX: translateX, y: translateY))
+    }
 }
 
 internal enum ScaleCalc {

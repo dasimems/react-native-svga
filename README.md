@@ -1,4 +1,4 @@
-# react-native-svga
+# @dasimems/react-native-svga
 
 A fast, secure SVGA player for React Native, built on [Nitro Modules](https://nitro.margelo.com/). Streams `.svga` files from the network or disk, caches them transparently, and plays both built-in audio tracks and external MP3s without disrupting the host app's audio session.
 
@@ -34,9 +34,9 @@ This package autolinks. There's no manifest to edit, no linking command to run; 
 ### Bare React Native CLI
 
 ```sh
-npm install react-native-svga react-native-nitro-modules
+npm install @dasimems/react-native-svga react-native-nitro-modules
 # or
-yarn add react-native-svga react-native-nitro-modules
+yarn add @dasimems/react-native-svga react-native-nitro-modules
 ```
 
 Then install the iOS pods:
@@ -55,12 +55,12 @@ npx react-native run-android
 
 ### Expo (with prebuild / development build)
 
-> **`react-native-svga` does not work in Expo Go.** Expo Go is a fixed, prebuilt binary - it cannot load custom native modules. You must use a development build (`expo prebuild` + a custom client). This is a one-time setup; afterwards your dev workflow is the same as with Expo Go.
+> **`@dasimems/react-native-svga` does not work in Expo Go.** Expo Go is a fixed, prebuilt binary - it cannot load custom native modules. You must use a development build (`expo prebuild` + a custom client). This is a one-time setup; afterwards your dev workflow is the same as with Expo Go.
 
 #### 1. Install the package and its peer dependency
 
 ```sh
-npx expo install react-native-svga react-native-nitro-modules
+npx expo install @dasimems/react-native-svga react-native-nitro-modules
 ```
 
 (Using `expo install` instead of `npm install` makes Expo align the versions with your SDK.)
@@ -71,7 +71,7 @@ npx expo install react-native-svga react-native-nitro-modules
 npx expo prebuild
 ```
 
-This creates the `ios/` and `android/` folders in your app, runs autolinking, and wires up `react-native-svga` (and `react-native-nitro-modules`) automatically. You only need to re-run prebuild when you add or remove a native module.
+This creates the `ios/` and `android/` folders in your app, runs autolinking, and wires up `@dasimems/react-native-svga` (and `react-native-nitro-modules`) automatically. You only need to re-run prebuild when you add or remove a native module.
 
 #### 3. Build and run a development client
 
@@ -108,7 +108,7 @@ npx expo start --dev-client
 After installing, confirm the native module is registered. From your app's entry file:
 
 ```ts
-import { SvgaCache } from 'react-native-svga';
+import { SvgaCache } from '@dasimems/react-native-svga';
 
 console.log(await SvgaCache.size()); // should print a number, not throw
 ```
@@ -118,7 +118,7 @@ If it throws "module not found", the autolinking step didn't run - rebuild the a
 ## Quick start
 
 ```tsx
-import { SvgaPlayer } from 'react-native-svga';
+import { SvgaPlayer } from '@dasimems/react-native-svga';
 import { View, StyleSheet } from 'react-native';
 
 export default function App() {
@@ -177,7 +177,7 @@ Schemes other than `http`, `https`, `file`, and `asset` are rejected for safety,
 ```tsx
 import { useRef } from 'react';
 import { Button, View } from 'react-native';
-import { SvgaPlayer, type SvgaPlayerHandle } from 'react-native-svga';
+import { SvgaPlayer, type SvgaPlayerHandle } from '@dasimems/react-native-svga';
 
 export function Controlled() {
   const ref = useRef<SvgaPlayerHandle>(null);
@@ -215,7 +215,7 @@ Available methods on the handle:
 Layer your own sounds on top of the animation and decide when each one fires:
 
 ```tsx
-import { SvgaPlayer, type SvgaSound } from 'react-native-svga';
+import { SvgaPlayer, type SvgaSound } from '@dasimems/react-native-svga';
 
 const sounds: SvgaSound[] = [
   { key: 'open',  url: 'https://cdn.example/open.mp3',   playOn: 'start',  volume: 0.8 },
@@ -256,7 +256,7 @@ Behaviour:
 For animations you know you'll play (e.g. gift animations in a livestream), warm the cache at app startup so the first play is instant:
 
 ```ts
-import { SvgaCache } from 'react-native-svga';
+import { SvgaCache } from '@dasimems/react-native-svga';
 
 useEffect(() => {
   SvgaCache.preload([
@@ -438,7 +438,7 @@ Set `playInBackground={true}` if you want video-player-style behaviour, where au
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| `Cannot find module 'react-native-svga'` at runtime | Native rebuild missed | Bare: re-run `pod install` and rebuild. Expo: re-run `expo prebuild` + `expo run:*` |
+| `Cannot find module '@dasimems/react-native-svga'` at runtime | Native rebuild missed | Bare: re-run `pod install` and rebuild. Expo: re-run `expo prebuild` + `expo run:*` |
 | Crashes/errors only in Expo Go | This package isn't supported by Expo Go | Switch to a development build (see Installation) |
 | Animation never appears, no error | `source` URL unreachable / 404 | Check the URL in a browser; listen on `onError` |
 | Built-in audio not playing | `muteBuiltInAudio` is `true`, or `sounds` is non-empty | Pass `muteBuiltInAudio={false}` |
