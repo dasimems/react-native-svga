@@ -324,6 +324,28 @@ final class HybridSvga: HybridSvgaSpec {
             audio.unloadAll()
             return
         }
+        // A DIFFERENT SVGA is on its way in. Blank the canvas NOW instead of
+        // holding the finished/previous frame on screen for the whole
+        // download + parse + decode of the incoming file — for a large SVGA
+        // that hold reads as the animation being "stuck" before it jumps to the
+        // next one. An empty canvas during the (brief, usually prefetch-warmed)
+        // gap is cleaner than a frozen frame, and if the load fails we stay
+        // blank rather than leaving a stale gift up. Gate it tightly:
+        //  - `entityRef != nil`: nothing on screen ⇒ nothing to clear.
+        //  - `value != activeSource`: `activeSource` still holds the OLD url at
+        //    this point, so this fires only on a genuine SOURCE change. A
+        //    cacheKey-only reload keeps the same visual, so blanking it would
+        //    just flicker.
+        // The same-url replay path (stop()+play() via the ref) never reaches
+        // handleSource — the `source` setter no-ops when the url is unchanged —
+        // so it is unaffected. Setting `entity = nil` tears down the sprite
+        // layers + display link; `applyEntity` installs and plays the incoming
+        // one once the load resolves.
+        if entityRef != nil && value != activeSource {
+            entityRef = nil
+            playerView.entity = nil
+            audio.stopAll()
+        }
         activeSource = value
         activeCacheKey = resolvedKey
         activeLoadId = SvgaSourceLoader.loadEntity(value, cacheKey: resolvedKey) { [weak self] result in

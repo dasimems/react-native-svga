@@ -1,6 +1,6 @@
 {
   "name": "@dasimems/react-native-svga",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Fast, secure SVGA animation player for React Native and Expo. Nitro-powered, with streaming, disk + memory caching, and built-in/external audio. A lightweight Lottie alternative for vector & sprite animations.",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",

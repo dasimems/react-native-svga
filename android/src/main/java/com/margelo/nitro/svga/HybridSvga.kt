@@ -31,6 +31,10 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
   // committing observable state. Cheap insurance even though the dominant
   // access pattern is main-only today.
   @Volatile private var entity: SvgaEntity? = null
+  // The source url currently loaded/loading. Lets handleSource tell a genuine
+  // SOURCE change from a cacheKey-only reload, so we blank the canvas only when
+  // the visible SVGA is actually being replaced (mirrors iOS `activeSource`).
+  private var activeSource: String? = null
   private var pendingPlayOnLoad = false
   private var wasPlayingBeforeWindowGone = false
   private var userPaused = false
@@ -252,6 +256,7 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
     if (value.isEmpty()) {
       entity?.release()
       entity = null
+      activeSource = null
       playerView.stop()
       playerView.entity = null
       // unloadAll (vs stopAll) so the prior SVGA's MediaPlayers are released
@@ -260,6 +265,24 @@ class HybridSvga(private val context: ThemedReactContext) : HybridSvgaSpec() {
       audio.unloadAll()
       return
     }
+    // A DIFFERENT SVGA is on its way in. Blank the canvas NOW instead of
+    // holding the previous frame for the whole load + decode of the incoming
+    // file — for a large SVGA that hold reads as the animation being "stuck"
+    // before it jumps to the next one. Empty during the (brief, usually
+    // prefetch-warmed) gap beats a frozen frame, and a failed load stays blank
+    // rather than leaving a stale gift up. Only on a genuine SOURCE change while
+    // something is showing (`activeSource` still holds the OLD url here); a
+    // cacheKey-only reload keeps the same visual, so blanking would just
+    // flicker. Setting `entity = null` here and on the view releases both +1
+    // bitmap refs and stops the frame loop; applyEntity installs + plays the
+    // incoming one once the load resolves.
+    if (entity != null && value != activeSource) {
+      entity?.release()
+      entity = null
+      playerView.entity = null
+      audio.stopAll()
+    }
+    activeSource = value
     loadJob = scope.launch {
       var parsed: SvgaEntity? = null
       var preparedAudio: List<SvgaAudioEngine.PreparedTrack> = emptyList()
