@@ -21,9 +21,13 @@ internal class SvgaSoundLibrary(private val context: Context) {
       val existing = tracks[key]
       if (existing != null && existing.sourcePath == newPath) return
       if (existing != null) {
-        try { existing.player.reset() } catch (_: Exception) {}
-        existing.player.release()
+        // Remove from the map first (under the lock), THEN defer the
+        // blocking reset()/release() to the disposer thread — once the
+        // track is unreachable, no play/stop can race the teardown. Keeps
+        // the lock hold time (and the caller's thread) free of media-server
+        // IPC; see SvgaMediaDisposer.
         tracks.remove(key)
+        SvgaMediaDisposer.dispose(existing.player)
       }
       val player = MediaPlayer()
       player.setAudioAttributes(
@@ -44,13 +48,14 @@ internal class SvgaSoundLibrary(private val context: Context) {
   }
 
   // play/stop/stopAll hold `loadLock` for the same reason `load`/`unload` do:
-  // a concurrent `unload` (or `release`) can call `MediaPlayer.release()` on
-  // the track while another caller is still inside `player.setVolume/seekTo/
-  // start`. The catch-IllegalStateException keeps us from crashing, but
-  // silently drops the sound. iOS sidesteps this by serialising every public
-  // method on a single dispatch queue; mirror that here so play/stop never
-  // race the player's lifecycle. ReentrantLock makes nested calls (e.g. test
-  // harnesses that call load→play synchronously) safe.
+  // the lookup in `tracks` and the subsequent `player.setVolume/seekTo/start`
+  // must be atomic against a concurrent `unload`/`release`. Teardown removes
+  // the track from the map UNDER THIS LOCK and only then hands the player to
+  // `SvgaMediaDisposer`, so a player is never physically released while any
+  // lock-holding caller can still reach it. iOS sidesteps this by serialising
+  // every public method on a single dispatch queue; this lock mirrors that.
+  // ReentrantLock makes nested calls (e.g. test harnesses that call
+  // load→play synchronously) safe.
   fun play(key: String, volume: Float) {
     loadLock.withLock {
       val track = tracks[key] ?: return
@@ -87,16 +92,14 @@ internal class SvgaSoundLibrary(private val context: Context) {
   fun unload(key: String) {
     loadLock.withLock {
       val track = tracks.remove(key) ?: return
-      try { track.player.reset() } catch (_: Exception) {}
-      track.player.release()
+      SvgaMediaDisposer.dispose(track.player)
     }
   }
 
   fun release() {
     loadLock.withLock {
       for ((_, track) in tracks) {
-        try { track.player.reset() } catch (_: Exception) {}
-        track.player.release()
+        SvgaMediaDisposer.dispose(track.player)
       }
       tracks.clear()
     }

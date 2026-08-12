@@ -15,6 +15,11 @@ internal object SvgaMemoryCache {
 
   @Volatile private var initialized = false
   @Volatile private var explicitLimit: Long? = null
+  // Device-safe upper bound on the decoded-bitmap cache, set in ensureInit
+  // from the device's RAM. Until then it's effectively unbounded so an early
+  // setMaxBytes isn't wrongly clamped; ensureInit re-applies it to any
+  // explicit limit already requested.
+  @Volatile private var deviceSafeCeilingBytes: Long = Long.MAX_VALUE
   // 0 disables — entries live until LRU evicts them. When set, hits older
   // than `maxAgeMs` are removed on access (treated as a miss). Atomic so
   // concurrent loaders don't tear the read.
@@ -53,7 +58,12 @@ internal object SvgaMemoryCache {
         if (initialized) return
         val app = context.applicationContext
         val am = app.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-        val limit = explicitLimit ?: defaultLimitFor(am)
+        deviceSafeCeilingBytes = deviceSafeCeilingFor(am)
+        // Clamp whatever was requested (or the default) to the device ceiling.
+        // A setMaxBytes that landed before ensureInit (ceiling still MAX) is
+        // re-clamped here now that we know the device class.
+        val requested = explicitLimit ?: defaultLimitFor(am)
+        val limit = requested.coerceAtMost(deviceSafeCeilingBytes)
         cache.resize(limit.toCapacity())
         app.registerComponentCallbacks(memoryCallbacks)
         // Inform the parser so its bitmap downsampling matches device class.
@@ -67,7 +77,11 @@ internal object SvgaMemoryCache {
   }
 
   fun setMaxBytes(bytes: Long) {
-    val safe = bytes.coerceAtLeast(0L)
+    // Clamp to the device-safe ceiling: the host app may request a large flat
+    // limit (e.g. 300 MB) that's fine on a high-RAM phone but ruinous on a
+    // low-RAM one — too big a decoded-bitmap cache trips a system memory trim
+    // that clears the very entries a preload just warmed.
+    val safe = bytes.coerceAtLeast(0L).coerceAtMost(deviceSafeCeilingBytes)
     // Acquire `storedAt` BEFORE the cache.resize call. Resize can trigger
     // entryRemoved (if shrinking), which itself acquires `storedAt`; if a
     // concurrent get/put on another thread is holding `storedAt` waiting
@@ -183,6 +197,25 @@ internal object SvgaMemoryCache {
     } finally {
       pendingReleases.set(null)
       for (e in list) e.release()
+    }
+  }
+
+  /// Upper bound on the in-memory (decoded-bitmap) cache for this device,
+  /// derived from RAM. Tunable. High-RAM devices get ~1/6 of total RAM (so a
+  /// 300 MB app request still sails through on 3 GB+); low-RAM devices are held
+  /// well below the trim threshold so a preload warm survives.
+  private fun deviceSafeCeilingFor(am: ActivityManager?): Long {
+    if (am == null) return DEFAULT_LIMIT_BYTES
+    val memoryClass = am.memoryClass
+    return when {
+      am.isLowRamDevice -> 32L * 1024 * 1024
+      memoryClass < 128 -> 48L * 1024 * 1024
+      memoryClass < 256 -> 128L * 1024 * 1024
+      else -> {
+        val info = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(info)
+        (info.totalMem / 6).coerceAtLeast(256L * 1024 * 1024)
+      }
     }
   }
 

@@ -37,10 +37,31 @@ internal final class SvgaMemoryCache {
     }
 
     func setMaxBytes(_ bytes: Int) {
-        let safe = max(0, bytes)
+        // Clamp the requested limit to a device-safe ceiling. The host app may
+        // request a large flat limit (e.g. 300 MB) that's fine on a high-RAM
+        // phone but ruinous on a low-RAM one — a decoded-bitmap cache that big
+        // pushes the device into memory pressure, the OS fires a trim, and the
+        // cache clears itself, wiping the very entries a preload just warmed.
+        // Honour the request where there's headroom; cap it where there isn't.
+        let safe = min(max(0, bytes), Self.deviceSafeCeiling())
         os_unfair_lock_lock(lock)
         cache.totalCostLimit = safe
         os_unfair_lock_unlock(lock)
+    }
+
+    /// Upper bound on the in-memory (decoded-bitmap) cache for this device,
+    /// derived from physical RAM. Tunable. High-RAM devices get ~1/6 of RAM
+    /// (so a 300 MB app request still sails through on 3 GB+); low-RAM devices
+    /// are held well below the trim threshold.
+    private static func deviceSafeCeiling() -> Int {
+        let totalBytes = ProcessInfo.processInfo.physicalMemory
+        let totalGB = Double(totalBytes) / 1_073_741_824.0
+        switch totalGB {
+        case ..<2.0: return 32 * 1024 * 1024
+        case ..<3.0: return 96 * 1024 * 1024
+        case ..<4.0: return 192 * 1024 * 1024
+        default: return max(Int(totalBytes / 6), 256 * 1024 * 1024)
+        }
     }
 
     func setMaxAgeMs(_ ms: Int64) {

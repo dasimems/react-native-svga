@@ -38,6 +38,13 @@ internal class SvgaPlayerView(context: Context) : View(context) {
 
   var maxLoops: Int = 0
   var frameInterval: Long = DEFAULT_FRAME_INTERVAL
+    set(value) {
+      field = value.coerceAtLeast(1L)
+      // A live speed change remaps elapsed-time → frame index; re-anchor so
+      // the new interval takes effect from the current frame instead of
+      // jumping (old anchor measured against a new interval).
+      if (playing) reanchor()
+    }
 
   fun interface WindowVisibilityListener { fun onVisibilityChanged(visible: Boolean) }
 
@@ -50,7 +57,15 @@ internal class SvgaPlayerView(context: Context) : View(context) {
   private var loopCount = 0
   private var playing = false
   private var hasRendered = false
-  private var nextFrameAt = 0L
+  // Wall-clock anchor for time-based frame selection. `startTimeNanos` is the
+  // monotonic time captured when playback (re)started; `anchorAbs` is the
+  // absolute frame index (loopCount * frames + currentFrame) at that instant.
+  // Each tick derives the frame from elapsed time, so a device that can't
+  // sustain the authored fps DROPS frames to stay real-time instead of
+  // stretching the timeline into slow motion. Re-anchored on resume, seek and
+  // speed change. Long to avoid Int overflow over very long infinite loops.
+  private var startTimeNanos = 0L
+  private var anchorAbs = 0L
 
   fun isPlaying(): Boolean = playing
 
@@ -82,11 +97,15 @@ internal class SvgaPlayerView(context: Context) : View(context) {
       // the handler queue across the (very brief) restart-before-tick
       // window.
       if (!playing) return
-      val nowMs = System.currentTimeMillis()
-      val drift = nowMs - nextFrameAt
-      val delay = (frameInterval - drift).coerceAtLeast(0L)
-      nextFrameAt = nowMs + delay
-      handler.postDelayed(this, delay)
+      // Aim the next wake at the next frame boundary relative to the play
+      // anchor. advance() derives the frame from elapsed wall-clock time and
+      // is self-correcting, so even a late wake resolves to the right frame
+      // (dropping frames as needed); this scheduling just avoids systematic
+      // drift and keeps us to ~one tick per frame.
+      val intervalNanos = (frameInterval * NANOS_PER_MS).coerceAtLeast(1L)
+      val sinceBoundary = (System.nanoTime() - startTimeNanos) % intervalNanos
+      val delayMs = ((intervalNanos - sinceBoundary) / NANOS_PER_MS).coerceIn(0L, frameInterval)
+      handler.postDelayed(this, delayMs)
     }
   }
 
@@ -94,7 +113,7 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     if (playing) return
     if (entity == null) return
     playing = true
-    nextFrameAt = System.currentTimeMillis() + frameInterval
+    reanchor()
     if (!hasRendered) {
       hasRendered = true
       try {
@@ -124,7 +143,12 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     val total = entity?.movie?.frames ?: return
     if (total <= 0) return
     currentFrame = frame.coerceIn(0, total - 1)
-    if (playing) onFrame?.onFrame(currentFrame, false)
+    // Re-anchor so time-based advance continues from the sought frame rather
+    // than snapping back to where elapsed wall-clock says we'd be.
+    if (playing) {
+      reanchor()
+      onFrame?.onFrame(currentFrame, false)
+    }
     invalidate()
   }
 
@@ -204,32 +228,78 @@ internal class SvgaPlayerView(context: Context) : View(context) {
     hasRendered = false
   }
 
+  /// Pin the time anchor to now and the current absolute frame, so subsequent
+  /// ticks measure elapsed playback from here. Called on (re)start, seek, and
+  /// speed change.
+  private fun reanchor() {
+    startTimeNanos = System.nanoTime()
+    val total = entity?.movie?.frames ?: 0
+    anchorAbs = if (total > 0) loopCount.toLong() * total + currentFrame else 0L
+  }
+
   private fun advance() {
     val movie = entity?.movie ?: return
     val total = movie.frames
     if (total <= 0) return
 
-    val nextFrame = currentFrame + 1
-    val isLast = nextFrame >= total
-    if (isLast) {
-      currentFrame = 0
-      if (loopCount < Int.MAX_VALUE) loopCount += 1
-      onLoop?.onLoop(loopCount)
-      if (maxLoops in 1..loopCount) {
-        playing = false
-        invalidate()
-        onFinish?.onFinish()
-        return
+    // Where elapsed wall-clock time says we should be (absolute frame index
+    // since the anchor), vs. where we currently are.
+    val intervalNanos = (frameInterval * NANOS_PER_MS).coerceAtLeast(1L)
+    val elapsedFrames = ((System.nanoTime() - startTimeNanos) / intervalNanos).coerceAtLeast(0L)
+    val targetAbs = anchorAbs + elapsedFrames
+    val baseAbs = loopCount.toLong() * total + currentFrame
+    if (targetAbs <= baseAbs) return
+
+    var steps = targetAbs - baseAbs
+    // Defensive cap on per-tick catch-up. Realistic gaps are a few frames (the
+    // loop is paused while hidden/backgrounded and re-anchored on resume). A
+    // pathological multi-second main-thread stall could otherwise replay
+    // thousands of audio cues / onLoop callbacks in one tick. Past a couple of
+    // loops the older history is moot — clamp the replay and re-anchor below so
+    // we don't perpetually chase the backlog.
+    val cap = (total.toLong() * 2).coerceAtLeast(1L)
+    val capped = steps > cap
+    if (capped) steps = cap
+
+    // Step frame-by-frame so audio start/end cues and per-loop callbacks fire
+    // for every crossed frame, but DRAW (invalidate) only once at the end —
+    // the expensive op runs once regardless of how many frames were dropped.
+    var i = 0L
+    while (i < steps) {
+      val nextFrame = currentFrame + 1
+      val isLast = nextFrame >= total
+      if (isLast) {
+        currentFrame = 0
+        if (loopCount < Int.MAX_VALUE) loopCount += 1
+        onLoop?.onLoop(loopCount)
+        if (maxLoops in 1..loopCount) {
+          playing = false
+          invalidate()
+          onFinish?.onFinish()
+          return
+        }
+      } else {
+        currentFrame = nextFrame
       }
-    } else {
-      currentFrame = nextFrame
+      // The audio cue handler matches start/end frame equality, so every
+      // crossed frame must be offered even though we invalidate once below.
+      onFrame?.onFrame(currentFrame, isLast)
+      i++
     }
 
-    onFrame?.onFrame(currentFrame, isLast)
+    if (capped) {
+      // Discard the unplayable backlog after an extreme stall so we resume
+      // real-time pacing from here instead of running fast to chase frames
+      // the user never saw.
+      startTimeNanos = System.nanoTime()
+      anchorAbs = loopCount.toLong() * total + currentFrame
+    }
+
     invalidate()
   }
 
   companion object {
     private const val DEFAULT_FRAME_INTERVAL = 66L
+    private const val NANOS_PER_MS = 1_000_000L
   }
 }

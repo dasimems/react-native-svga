@@ -18,9 +18,13 @@ import kotlinx.coroutines.withContext
 
 internal object SvgaSourceLoader {
 
-  private const val CONNECT_TIMEOUT_MS = 15_000
-  private const val READ_TIMEOUT_MS = 30_000
+  private const val CONNECT_TIMEOUT_MS = 30_000
+  private const val READ_TIMEOUT_MS = 60_000
   private const val MAX_DOWNLOAD_BYTES = 64L * 1024 * 1024
+  // Total download attempts (initial + retries) for a transient network
+  // failure. Mobile timeouts/drops are usually momentary, so a couple of
+  // backed-off retries recover far more loads than one longer timeout would.
+  private const val MAX_DOWNLOAD_ATTEMPTS = 3
 
   class SourceException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
@@ -132,8 +136,13 @@ internal object SvgaSourceLoader {
     val cached = SvgaDiskCache.cachedFile(ctx, cacheKey)
     if (cached != null) return cached.inputStream()
     val bytes = downloadBytes(resolved.value)
-    val saved = SvgaDiskCache.saveSvga(ctx, cacheKey, bytes)
-    return saved.inputStream()
+    // Best-effort disk-cache warm; skipped when the device is out of space.
+    // Playback never depends on the write succeeding — we parse from the
+    // in-memory bytes we just downloaded, so a full disk degrades to "no
+    // caching", not "no playback" (previously a failed saveSvga threw and
+    // broke the load entirely).
+    SvgaDiskCache.saveSvgaQuietly(ctx, cacheKey, bytes)
+    return java.io.ByteArrayInputStream(bytes)
   }
 
   private fun readAssetBytes(ctx: Context, name: String): ByteArray {
@@ -141,6 +150,28 @@ internal object SvgaSourceLoader {
   }
 
   private fun downloadBytes(url: String): ByteArray {
+    var attempt = 1
+    while (true) {
+      try {
+        return downloadBytesOnce(url)
+      } catch (e: Exception) {
+        // Respect cancellation (runInterruptible interrupts this thread) and
+        // don't retry HTTP-status / payload errors — only transient network
+        // failures.
+        if (Thread.currentThread().isInterrupted) throw e
+        if (attempt >= MAX_DOWNLOAD_ATTEMPTS || !isRetryable(e)) throw e
+        try {
+          Thread.sleep(backoffMs(attempt))
+        } catch (ie: InterruptedException) {
+          Thread.currentThread().interrupt()
+          throw e
+        }
+        attempt++
+      }
+    }
+  }
+
+  private fun downloadBytesOnce(url: String): ByteArray {
     val conn = URL(url).openConnection() as HttpURLConnection
     conn.connectTimeout = CONNECT_TIMEOUT_MS
     conn.readTimeout = READ_TIMEOUT_MS
@@ -160,6 +191,19 @@ internal object SvgaSourceLoader {
       conn.disconnect()
     }
   }
+
+  /// Transient, worth-retrying network failures. SourceException (HTTP status,
+  /// payload-too-large) and interruption are deliberately excluded.
+  private fun isRetryable(e: Throwable): Boolean = when (e) {
+    is java.net.SocketTimeoutException,
+    is java.net.ConnectException,
+    is java.net.UnknownHostException -> true
+    else -> false
+  }
+
+  /// Exponential backoff: 500ms, 1s, 2s … capped at 4s.
+  private fun backoffMs(attempt: Int): Long =
+    (500L shl (attempt - 1).coerceIn(0, 3)).coerceAtMost(4000L)
 
   private fun readBounded(input: InputStream, limit: Long): ByteArray {
     val out = java.io.ByteArrayOutputStream()

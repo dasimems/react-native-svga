@@ -9,6 +9,10 @@ internal object SvgaDiskCache {
   private const val SVGA_DIR = "svga_cache"
   private const val SOUND_DIR = "svga_sounds"
   private const val DEFAULT_LIMIT = 50L * 1024 * 1024
+  /// Headroom we refuse to consume. When the volume's free space would drop
+  /// below the incoming size + this margin, we skip the cache write entirely
+  /// rather than push the device toward full (and trip ENOSPC). 10 MB.
+  private const val DISK_SAFETY_MARGIN = 10L * 1024 * 1024
   private val maxBytes = AtomicLong(DEFAULT_LIMIT)
   /// Max age (TTL) in ms. 0 disables — entries live until LRU evicts them.
   /// When set, reads of entries older than `maxAgeMs` return null (treated
@@ -66,19 +70,41 @@ internal object SvgaDiskCache {
   fun saveSvga(ctx: Context, cacheKey: String, bytes: ByteArray): File {
     val file = svgaFile(ctx, cacheKey)
     synchronized(writeLock) {
-      evictToMakeRoom(svgaDir(ctx), maxBytes.get(), bytes.size.toLong(), file)
-      writeAtomic(file, bytes)
-      touch(file)
+      val dir = svgaDir(ctx)
+      evictToMakeRoom(dir, maxBytes.get(), bytes.size.toLong(), file)
+      // If the device is out of space, skip the write rather than trip
+      // ENOSPC. Playback parses from the in-memory bytes (see
+      // SvgaSourceLoader.openStream), so a skipped write just means the next
+      // load re-downloads. (Eviction ran first: if our own budget was the
+      // pressure, it already freed room and this passes.)
+      if (hasRoomOnDisk(dir, bytes.size.toLong())) {
+        writeAtomic(file, bytes)
+        touch(file)
+      }
     }
     return file
+  }
+
+  /// Best-effort variant that never throws. Used on the playback load path,
+  /// where the entity is parsed from the in-memory bytes and the disk write is
+  /// only a cache warm — a failed or skipped write must not break playback.
+  fun saveSvgaQuietly(ctx: Context, cacheKey: String, bytes: ByteArray) {
+    try {
+      saveSvga(ctx, cacheKey, bytes)
+    } catch (_: Throwable) {
+      // intentional: best-effort cache write
+    }
   }
 
   fun saveSound(ctx: Context, key: String, bytes: ByteArray): File {
     val file = soundFile(ctx, key)
     synchronized(writeLock) {
-      evictToMakeRoom(soundDir(ctx), maxBytes.get(), bytes.size.toLong(), file)
-      writeAtomic(file, bytes)
-      touch(file)
+      val dir = soundDir(ctx)
+      evictToMakeRoom(dir, maxBytes.get(), bytes.size.toLong(), file)
+      if (hasRoomOnDisk(dir, bytes.size.toLong())) {
+        writeAtomic(file, bytes)
+        touch(file)
+      }
     }
     return file
   }
@@ -119,6 +145,20 @@ internal object SvgaDiskCache {
       }
     }
     return removed
+  }
+
+  /// True when the volume backing `dir` has room for `incoming` bytes plus our
+  /// safety margin. `usableSpace == 0` means it couldn't be determined — allow
+  /// the write so behaviour matches the old unconditional path (a real ENOSPC
+  /// is still caught by writeAtomic). Queried per write since free space is
+  /// device-global and changes over time.
+  private fun hasRoomOnDisk(dir: File, incoming: Long): Boolean {
+    return try {
+      val usable = dir.usableSpace
+      if (usable <= 0L) true else usable >= incoming + DISK_SAFETY_MARGIN
+    } catch (_: Throwable) {
+      true
+    }
   }
 
   private fun isExpired(file: File): Boolean {

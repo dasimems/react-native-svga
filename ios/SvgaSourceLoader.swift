@@ -21,12 +21,49 @@ internal enum SvgaSourceLoader {
 
     private static let session: URLSession = {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 15
-        config.timeoutIntervalForResource = 60
+        // Per-request idle timeout (max gap between received bytes). 15s was
+        // too aggressive on flaky cellular — a brief stall mid-download tripped
+        // NSURLErrorTimedOut (-1001) and failed the gift preload outright.
+        config.timeoutIntervalForRequest = 30
+        // Overall ceiling for one resource. A large SVGA on a slow link can
+        // legitimately take longer than the old 60s.
+        config.timeoutIntervalForResource = 120
         config.waitsForConnectivity = false
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         return URLSession(configuration: config)
     }()
+
+    /// Total download attempts (initial + retries) for a transient network
+    /// failure. Timeouts and dropped connections on mobile are usually
+    /// momentary, so a couple of backed-off retries recover far more loads
+    /// than a single longer timeout would.
+    private static let MAX_DOWNLOAD_ATTEMPTS = 3
+    /// Serial queue used only to schedule retry dispatches. Must NOT be
+    /// `inFlightQueue` — `download` re-enters `inFlightQueue.sync` to
+    /// re-register the retry task, which would deadlock on a re-entrant sync.
+    private static let retryQueue = DispatchQueue(label: "svga.loader.retry")
+
+    /// Transient, worth-retrying network errors. User cancellation and
+    /// HTTP-status / payload errors are deliberately excluded.
+    private static func isRetryable(_ error: NSError) -> Bool {
+        guard error.domain == NSURLErrorDomain else { return false }
+        switch error.code {
+        case NSURLErrorTimedOut,
+             NSURLErrorCannotConnectToHost,
+             NSURLErrorCannotFindHost,
+             NSURLErrorNetworkConnectionLost,
+             NSURLErrorDNSLookupFailed,
+             NSURLErrorNotConnectedToInternet:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Exponential backoff: 0.5s, 1s, 2s … capped at 4s.
+    private static func backoffDelay(forAttempt attempt: Int) -> TimeInterval {
+        return min(0.5 * pow(2.0, Double(max(0, attempt - 1))), 4.0)
+    }
 
     /// Heavy work (`SvgaParser.parse` runs zlib/zip inflate up to 64 MB and
     /// decodes every embedded image) is moved off the URLSession completion
@@ -275,13 +312,23 @@ internal enum SvgaSourceLoader {
         }
     }
 
-    private static func download(_ urlString: String, attachTaskFor sourceForCancel: String? = nil, completion: @escaping (Result<Data, Error>) -> Void) {
+    private static func download(_ urlString: String, attachTaskFor sourceForCancel: String? = nil, attempt: Int = 1, completion: @escaping (Result<Data, Error>) -> Void) {
         guard let url = URL(string: urlString) else {
             completion(.failure(SvgaError("invalid url")))
             return
         }
         let task = session.downloadTask(with: url) { tempURL, response, error in
             if let error = error {
+                // Retry transient network failures (timeout, connection lost)
+                // with backoff before giving up. Cancellation and HTTP/payload
+                // errors fall through to the caller unchanged.
+                let nsError = error as NSError
+                if isRetryable(nsError) && attempt < MAX_DOWNLOAD_ATTEMPTS {
+                    retryQueue.asyncAfter(deadline: .now() + backoffDelay(forAttempt: attempt)) {
+                        download(urlString, attachTaskFor: sourceForCancel, attempt: attempt + 1, completion: completion)
+                    }
+                    return
+                }
                 completion(.failure(error))
                 return
             }

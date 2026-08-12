@@ -9,6 +9,46 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import java.io.File
+import java.util.concurrent.Executors
+
+/**
+ * Shared single-thread executor for the blocking part of MediaPlayer teardown.
+ *
+ * `MediaPlayer.reset()` and `release()` are synchronous binder IPC into the
+ * system media server; on a busy device (another SDK holding the audio
+ * pipeline, a loaded mediaserver) they can stall for tens to hundreds of
+ * milliseconds. Historically both engines ran them on the caller's thread —
+ * for `SvgaAudioEngine` that is the MAIN thread (`installTracks`, source
+ * swaps, `dispose`), so every gift-audio swap paid that stall on the UI
+ * thread, an ANR contributor under gift storms. `SvgaSoundLibrary` paid it on
+ * the JS thread via Nitro.
+ *
+ * Correctness contract: the caller must make the player UNREACHABLE (flag it
+ * `released`, remove it from every collection) before handing it here, so
+ * this thread is the player's sole remaining owner and the release can never
+ * race a `start()`/`pause()`/`seekTo()` from a live code path.
+ */
+internal object SvgaMediaDisposer {
+  private val executor = Executors.newSingleThreadExecutor { r ->
+    Thread(r, "SvgaMediaDisposer").apply {
+      isDaemon = true
+      priority = Thread.NORM_PRIORITY - 1
+    }
+  }
+
+  fun dispose(
+    player: MediaPlayer,
+    source: MediaDataSource? = null,
+    tempFile: File? = null,
+  ) {
+    executor.execute {
+      try { player.reset() } catch (_: Exception) {}
+      try { player.release() } catch (_: Exception) {}
+      try { source?.close() } catch (_: Exception) {}
+      tempFile?.delete()
+    }
+  }
+}
 
 /**
  * Plays the audio tracks bundled inside an `.svga` file, frame-synced to the
@@ -23,6 +63,11 @@ import java.io.File
  *    Track state mutated from there is `@Volatile`. All `tracks`-list access
  *    is wrapped in `synchronized(tracksLock)` because `unload()` may run on
  *    any caller thread (e.g. `release()` from `dispose()` on JS thread).
+ *  - Physical teardown (`reset()`/`release()` — blocking media-server IPC)
+ *    is deferred to `SvgaMediaDisposer`'s background thread. `unload()` /
+ *    `releasePrepared()` only do non-blocking work on the caller's thread:
+ *    flag the track `released`, detach it from the collections, null the
+ *    error listener, then hand the exclusively-owned player off.
  *  - The audio-error listener is dispatched to main via `mainHandler.post`
  *    so consumers always receive errors on a known thread.
  *
@@ -173,14 +218,13 @@ internal class SvgaAudioEngine(private val context: Context) {
   fun releasePrepared(prepared: List<PreparedTrack>) {
     for (p in prepared) {
       val track = p.track ?: continue
+      // Flag + detach the listener synchronously (plain field writes, no
+      // IPC) so nothing can touch or report on this player after we return;
+      // the blocking reset()/release() then runs on the disposer thread.
       track.released = true
-      try {
-        track.player.setOnErrorListener(null)
-        track.player.reset()
-      } catch (_: Exception) {}
-      try { track.player.release() } catch (_: Exception) {}
-      track.source?.close()
-      track.tempFile?.delete()
+      track.prepared = false
+      try { track.player.setOnErrorListener(null) } catch (_: Exception) {}
+      SvgaMediaDisposer.dispose(track.player, track.source, track.tempFile)
     }
   }
 
@@ -296,18 +340,20 @@ internal class SvgaAudioEngine(private val context: Context) {
       copy
     }
     for (track in toRelease) {
-      // Mark released BEFORE clearing listeners + reset + release so any
-      // concurrent OnErrorListener that fires after we null the listener
-      // still sees the flag and short-circuits.
+      // Mark released BEFORE clearing the listener so any concurrent
+      // OnErrorListener that fires after we null it still sees the flag and
+      // short-circuits. Both are plain field writes; the blocking
+      // reset()/release() is deferred to the disposer thread. That deferral
+      // is safe because this track is already out of `tracks` and
+      // `mutePausedTracks` (removed above, under the lock) and flagged
+      // `released` — every live code path checks the flag or looks the
+      // track up in those collections first, and all live-player access
+      // runs on the main thread, which is where unload()'s callers run. So
+      // by the time the disposer touches the player, nothing else can.
       track.released = true
       track.prepared = false
-      try {
-        track.player.setOnErrorListener(null)
-        track.player.reset()
-      } catch (_: Exception) {}
-      try { track.player.release() } catch (_: Exception) {}
-      track.source?.close()
-      track.tempFile?.delete()
+      try { track.player.setOnErrorListener(null) } catch (_: Exception) {}
+      SvgaMediaDisposer.dispose(track.player, track.source, track.tempFile)
     }
   }
 

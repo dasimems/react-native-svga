@@ -66,7 +66,15 @@ internal final class SvgaPlayerView: UIView {
         }
     }
     var maxLoops: Int = 0
-    var frameInterval: TimeInterval = 1.0 / 15.0
+    var frameInterval: TimeInterval = 1.0 / 15.0 {
+        didSet {
+            // A live speed change remaps elapsed-time → frame index. Re-anchor
+            // so the new interval takes effect smoothly from the current frame
+            // instead of teleporting (old anchor measured against a new
+            // interval would jump the position).
+            if isPlaying { reanchor(at: CACurrentMediaTime()) }
+        }
+    }
 
     var onFrame: FrameHandler?
     var onLoop: LoopHandler?
@@ -79,7 +87,15 @@ internal final class SvgaPlayerView: UIView {
     private var loopCount: Int = 0
     private var hasRendered: Bool = false
     private var displayLink: CADisplayLink?
-    private var lastTickAt: CFTimeInterval = 0
+    /// Wall-clock anchor for time-based frame selection. `startTime` is the
+    /// media time captured when playback (re)started; `anchorAbs` is the
+    /// absolute frame index (`loopCount × frames + currentFrame`) at that
+    /// instant. Each tick derives the frame from elapsed time since the
+    /// anchor, so a device that can't sustain the authored fps DROPS frames to
+    /// stay real-time instead of stretching the timeline into slow motion.
+    /// Re-anchored on resume, seek, and speed change.
+    private var startTime: CFTimeInterval = 0
+    private var anchorAbs: Int = 0
 
     /// One layer per `movie.sprites` entry, in source (z) order. Parallel to
     /// `entity.movie.sprites` — index i here renders sprite i.
@@ -122,7 +138,7 @@ internal final class SvgaPlayerView: UIView {
         if isPlaying { return }
         if entity == nil { return }
         isPlaying = true
-        lastTickAt = CACurrentMediaTime()
+        reanchor(at: CACurrentMediaTime())
         if !hasRendered {
             hasRendered = true
             onFrame?(currentFrame, false)
@@ -167,7 +183,12 @@ internal final class SvgaPlayerView: UIView {
     func seekToFrame(_ frame: Int) {
         guard let total = entity?.movie.frames, total > 0 else { return }
         currentFrame = max(0, min(total - 1, frame))
-        if isPlaying { onFrame?(currentFrame, false) }
+        // Re-anchor so time-based advance continues from the sought frame
+        // rather than snapping back to where elapsed wall-clock says we'd be.
+        if isPlaying {
+            reanchor(at: CACurrentMediaTime())
+            onFrame?(currentFrame, false)
+        }
         applyFrame(currentFrame)
     }
 
@@ -178,9 +199,10 @@ internal final class SvgaPlayerView: UIView {
     }
 
     @objc fileprivate func onDisplayTick(_ link: CADisplayLink) {
-        let now = link.timestamp
-        if now - lastTickAt < frameInterval { return }
-        lastTickAt = now
+        // No interval gate here: `advance()` derives the target frame from
+        // elapsed wall-clock time and only mutates state when at least one
+        // frame is due, so a tick that arrives early is a cheap no-op and a
+        // tick that arrives late catches up by dropping frames.
         advance()
     }
 
@@ -279,30 +301,77 @@ internal final class SvgaPlayerView: UIView {
         hasRendered = false
     }
 
+    /// Pin the time anchor to `time` and the current absolute frame, so
+    /// subsequent ticks measure elapsed playback from here. Called on
+    /// (re)start, seek, and speed change.
+    private func reanchor(at time: CFTimeInterval) {
+        startTime = time
+        if let total = entity?.movie.frames, total > 0 {
+            anchorAbs = loopCount * total + currentFrame
+        } else {
+            anchorAbs = 0
+        }
+    }
+
     private func advance() {
         guard let movie = entity?.movie else { return }
         let total = movie.frames
         if total <= 0 { return }
 
-        let next = currentFrame + 1
-        let isLast = next >= total
-        if isLast {
-            currentFrame = 0
-            if loopCount < Int.max { loopCount += 1 }
-            onLoop?(loopCount)
-            if maxLoops > 0 && loopCount >= maxLoops {
-                isPlaying = false
-                displayLink?.invalidate()
-                displayLink = nil
-                applyFrame(currentFrame)
-                onFinish?()
-                return
+        // Where elapsed wall-clock time says we should be (absolute frame
+        // index since the anchor), vs. where we currently are.
+        let now = displayLink?.timestamp ?? CACurrentMediaTime()
+        let elapsedFrames = max(0, Int((now - startTime) / frameInterval))
+        let targetAbs = anchorAbs + elapsedFrames
+        let baseAbs = loopCount * total + currentFrame
+        if targetAbs <= baseAbs { return }
+
+        var steps = targetAbs - baseAbs
+        // Defensive cap on per-tick catch-up. Realistic gaps are a few frames
+        // (the display link is paused while hidden/backgrounded and re-anchored
+        // on resume). A pathological multi-second main-thread stall could
+        // otherwise replay thousands of audio cues / onLoop callbacks in one
+        // tick. Past a couple of loops the older history is moot — clamp the
+        // replay and re-anchor below so we don't perpetually chase the backlog.
+        let cap = max(total * 2, 1)
+        let capped = steps > cap
+        if capped { steps = cap }
+
+        // Step frame-by-frame so audio start/end cues and per-loop callbacks
+        // fire for every crossed frame, but DRAW only the final frame — the
+        // expensive op (applyFrame) runs once regardless of how many frames
+        // were dropped. This is the old per-tick logic, time-compressed.
+        for _ in 0..<steps {
+            let next = currentFrame + 1
+            let isLast = next >= total
+            if isLast {
+                currentFrame = 0
+                if loopCount < Int.max { loopCount += 1 }
+                onLoop?(loopCount)
+                if maxLoops > 0 && loopCount >= maxLoops {
+                    isPlaying = false
+                    displayLink?.invalidate()
+                    displayLink = nil
+                    applyFrame(currentFrame)
+                    onFinish?()
+                    return
+                }
+            } else {
+                currentFrame = next
             }
-        } else {
-            currentFrame = next
+            // The audio cue handler matches on start/end frame equality, so
+            // every crossed frame must be offered even though we draw once.
+            onFrame?(currentFrame, isLast)
         }
 
-        onFrame?(currentFrame, isLast)
+        if capped {
+            // Discard the unplayable backlog after an extreme stall so we
+            // resume real-time pacing from here instead of running fast to
+            // chase frames the user never saw.
+            startTime = now
+            anchorAbs = loopCount * total + currentFrame
+        }
+
         applyFrame(currentFrame)
     }
 }

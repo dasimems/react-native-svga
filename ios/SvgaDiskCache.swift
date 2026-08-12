@@ -6,6 +6,10 @@ internal enum SvgaDiskCache {
     private static let SOUND_DIR = "svga_sounds"
     private static let DEFAULT_LIMIT: Int64 = 50 * 1024 * 1024
     private static var maxBytes: Int64 = DEFAULT_LIMIT
+    /// Headroom we refuse to consume. When the device's free space would drop
+    /// below the incoming size + this margin, we skip the cache write entirely
+    /// rather than push the volume toward full (and trip ENOSPC). 10 MB.
+    private static let DISK_SAFETY_MARGIN: Int64 = 10 * 1024 * 1024
     /// Max age (TTL) in milliseconds. 0 disables TTL — entries live until LRU
     /// evicts them. When set, reads of older-than-TTL entries return nil
     /// (cache miss → fresh download), and `evictExpired()` walks the dirs to
@@ -100,6 +104,13 @@ internal enum SvgaDiskCache {
         writeQueue.sync {
             do {
                 evictToMakeRoom(in: SVGA_DIR, limit: getMaxBytes(), incoming: Int64(data.count), replacing: url)
+                // If the device is out of space, skip the write rather than
+                // attempt it (and fail with ENOSPC). Playback never depends on
+                // the SVGA disk cache — the entity is parsed from the in-memory
+                // bytes — so a skipped write just means the next load
+                // re-downloads. (Eviction ran first: if our own budget was the
+                // pressure, it already freed room and this passes.)
+                if !hasRoomOnDisk(for: Int64(data.count)) { return }
                 try writeAtomic(url, data: data)
             } catch {
                 thrown = error
@@ -118,6 +129,7 @@ internal enum SvgaDiskCache {
         writeQueue.async {
             do {
                 evictToMakeRoom(in: SVGA_DIR, limit: getMaxBytes(), incoming: Int64(data.count), replacing: url)
+                if !hasRoomOnDisk(for: Int64(data.count)) { return }
                 try writeAtomic(url, data: data)
             } catch {
                 // intentional: best-effort cache write
@@ -131,6 +143,7 @@ internal enum SvgaDiskCache {
         writeQueue.sync {
             do {
                 evictToMakeRoom(in: SOUND_DIR, limit: getMaxBytes(), incoming: Int64(data.count), replacing: url)
+                if !hasRoomOnDisk(for: Int64(data.count)) { return }
                 try writeAtomic(url, data: data)
             } catch {
                 thrown = error
@@ -223,6 +236,21 @@ internal enum SvgaDiskCache {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         return dir
+    }
+
+    /// True when the device has room for `incoming` bytes plus our safety
+    /// margin. If free space can't be determined we return `true` so behaviour
+    /// matches the old unconditional write (a genuine ENOSPC is still caught by
+    /// `writeAtomic`). Queried per write because free space is device-global
+    /// and can change between writes.
+    private static func hasRoomOnDisk(for incoming: Int64) -> Bool {
+        let probe = (try? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
+            ?? FileManager.default.temporaryDirectory
+        guard let values = try? probe.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+              let available = values.volumeAvailableCapacityForImportantUsage else {
+            return true
+        }
+        return available >= incoming + DISK_SAFETY_MARGIN
     }
 
     private static func writeAtomic(_ target: URL, data: Data) throws {
