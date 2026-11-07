@@ -12,6 +12,9 @@ export interface SvgaManager extends HybridObject<{
   isCached(cacheKey: string): boolean;
   getCachePath(cacheKey: string): string | undefined;
   clearCache(): void;
+  // Drops decoded entities from memory only; the disk cache is kept, so the
+  // next play re-decodes from disk without downloading again.
+  clearMemoryCache(): void;
   getCacheSize(): Promise<number>;
   getCacheCount(): Promise<number>;
   setCacheLimit(bytes: number): void;

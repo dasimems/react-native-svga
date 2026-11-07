@@ -1,5 +1,6 @@
 package com.margelo.nitro.svga
 
+import android.content.res.Resources
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.RectF
@@ -129,7 +130,7 @@ internal object SvgaParser {
     for ((key, blob) in parsed.inlineBlobs) {
       if (imageBytes[key] == null && audioBytes[key] == null) imageBytes[key] = blob
     }
-    val bitmaps = decodeBitmaps(imageBytes)
+    val bitmaps = decodeBitmaps(imageBytes, parsed.movie)
     composeTransforms(parsed.movie, bitmaps)
     return SvgaEntity(parsed.movie, bitmaps, audioBytes)
   }
@@ -137,7 +138,7 @@ internal object SvgaParser {
   private fun parseFromMovieBinary(bytes: ByteArray): SvgaEntity {
     val parsed = parseMovie(bytes)
     val (imageBytes, audioBytes) = classifyBlobs(parsed)
-    val bitmaps = decodeBitmaps(imageBytes)
+    val bitmaps = decodeBitmaps(imageBytes, parsed.movie)
     composeTransforms(parsed.movie, bitmaps)
     return SvgaEntity(parsed.movie, bitmaps, audioBytes)
   }
@@ -196,25 +197,79 @@ internal object SvgaParser {
     return out.toByteArray()
   }
 
-  private fun decodeBitmaps(source: Map<String, ByteArray>): Map<String, android.graphics.Bitmap> {
+  private fun decodeBitmaps(
+    source: Map<String, ByteArray>,
+    movie: MovieEntity
+  ): Map<String, android.graphics.Bitmap> {
+    val drawn = drawnSizes(movie)
     val out = HashMap<String, android.graphics.Bitmap>(source.size)
     for ((key, blob) in source) {
-      val bmp = decodeBitmap(blob) ?: continue
+      val bmp = decodeBitmap(blob, drawn[key]) ?: continue
       out[key] = bmp
     }
     return out
   }
 
-  private fun decodeBitmap(blob: ByteArray): android.graphics.Bitmap? {
+  // Decode a little above the exact drawn size so sprites stay crisp.
+  private const val DISPLAY_HEADROOM = 1.1f
+
+  /**
+   * The largest size each image is drawn at, in screen pixels, across every
+   * sprite and frame using it. Runs on the authored frame transforms, before
+   * `composeTransforms` folds in the bitmap scale.
+   */
+  internal fun drawnSizes(
+    movie: MovieEntity,
+    screenWidth: Int = Resources.getSystem().displayMetrics.widthPixels,
+    screenHeight: Int = Resources.getSystem().displayMetrics.heightPixels
+  ): Map<String, Pair<Float, Float>> {
+    if (screenWidth <= 0 || screenHeight <= 0) return emptyMap()
+    if (movie.viewBoxWidth <= 0f || movie.viewBoxHeight <= 0f) return emptyMap()
+    // Fill-scale bounds both aspect-fit and aspect-fill, in either orientation.
+    val long = maxOf(screenWidth, screenHeight).toFloat()
+    val short = minOf(screenWidth, screenHeight).toFloat()
+    val toScreen = maxOf(short / movie.viewBoxWidth, long / movie.viewBoxHeight)
+    val values = FloatArray(9)
+    val out = HashMap<String, Pair<Float, Float>>()
+    for (sprite in movie.sprites) {
+      var w = out[sprite.imageKey]?.first ?: 0f
+      var h = out[sprite.imageKey]?.second ?: 0f
+      for (frame in sprite.frames) {
+        if (!frame.hasContent) continue
+        frame.transform.getValues(values)
+        val sx = Math.hypot(values[Matrix.MSCALE_X].toDouble(), values[Matrix.MSKEW_Y].toDouble()).toFloat()
+        val sy = Math.hypot(values[Matrix.MSKEW_X].toDouble(), values[Matrix.MSCALE_Y].toDouble()).toFloat()
+        w = maxOf(w, frame.layout.width() * sx * toScreen)
+        h = maxOf(h, frame.layout.height() * sy * toScreen)
+      }
+      if (w > 0f && h > 0f) out[sprite.imageKey] = w to h
+    }
+    return out
+  }
+
+  /**
+   * Power-of-two sample size for a `w`×`h` bitmap drawn at `drawn`: as small
+   * as the drawn size allows (never below it), and at least enough to fit the
+   * device cap.
+   */
+  internal fun sampleSizeFor(w: Int, h: Int, drawn: Pair<Float, Float>?, cap: Int): Int {
+    var sampleSize = 1
+    while (maxOf(w, h) / sampleSize > cap) sampleSize *= 2
+    if (drawn == null) return sampleSize
+    val needW = drawn.first * DISPLAY_HEADROOM
+    val needH = drawn.second * DISPLAY_HEADROOM
+    while (w / (sampleSize * 2) >= needW && h / (sampleSize * 2) >= needH) sampleSize *= 2
+    return sampleSize
+  }
+
+  private fun decodeBitmap(blob: ByteArray, drawn: Pair<Float, Float>?): android.graphics.Bitmap? {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeByteArray(blob, 0, blob.size, bounds)
     val w = bounds.outWidth
     val h = bounds.outHeight
     if (w <= 0 || h <= 0) return null
 
-    var sampleSize = 1
-    val cap = maxBitmapDimension
-    while (maxOf(w, h) / sampleSize > cap) sampleSize *= 2
+    val sampleSize = sampleSizeFor(w, h, drawn, maxBitmapDimension)
 
     val opts = BitmapFactory.Options().apply {
       inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888

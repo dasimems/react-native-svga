@@ -99,6 +99,10 @@ class HybridSvgaManager : HybridSvgaManagerSpec() {
     }
   }
 
+  override fun clearMemoryCache() {
+    SvgaMemoryCache.clear()
+  }
+
   override fun clearCache() {
     // Memory clear is cheap and synchronous so the next memory-cache read
     // sees a miss immediately. The on-disk delete walks the cache dirs and

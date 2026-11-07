@@ -107,6 +107,7 @@ internal final class SvgaPlayerView: UIView {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+        SvgaParser.captureScreenSize()
         backgroundColor = .clear
         isOpaque = false
         layer.isGeometryFlipped = false

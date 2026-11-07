@@ -16,6 +16,38 @@ internal enum SvgaParser {
     /// host (`HybridSvgaManager.init`) can compute it once at startup.
     static var maxBitmapDimension: Int = defaultBitmapDimension()
 
+    /// The screen in physical pixels, set on the main thread (UIScreen is
+    /// main-only) and read by the parse queue to decode sprites at the size
+    /// they are actually drawn. Zero until known: decode then falls back to
+    /// `maxBitmapDimension` alone.
+    private static let screenLock = NSLock()
+    private static var _screenPixels: CGSize = .zero
+    static var screenPixels: CGSize {
+        get {
+            screenLock.lock()
+            defer { screenLock.unlock() }
+            return _screenPixels
+        }
+        set {
+            screenLock.lock()
+            _screenPixels = newValue
+            screenLock.unlock()
+        }
+    }
+
+    /// Records the screen size once. Safe from any thread: UIScreen is read on
+    /// main (async when called elsewhere, so a decode already running just
+    /// uses the device cap).
+    static func captureScreenSize() {
+        if screenPixels != .zero { return }
+        let read = { SvgaParser.screenPixels = UIScreen.main.nativeBounds.size }
+        if Thread.isMainThread { read() } else { DispatchQueue.main.async(execute: read) }
+    }
+
+    /// Decode a little above the exact drawn size so sprites stay crisp when a
+    /// transform lands between pixels.
+    private static let DISPLAY_HEADROOM: CGFloat = 1.1
+
     private static func defaultBitmapDimension() -> Int {
         let totalBytes = ProcessInfo.processInfo.physicalMemory
         let totalGB = Double(totalBytes) / 1_073_741_824.0
@@ -113,7 +145,7 @@ internal enum SvgaParser {
             }
         }
 
-        let images = decodeImages(imageBytes)
+        let images = decodeImages(imageBytes, movie: parsed.movie)
         composeTransforms(parsed.movie, images: images)
         return SvgaEntity(movie: parsed.movie, images: images, audioData: audioBytes)
     }
@@ -121,7 +153,7 @@ internal enum SvgaParser {
     private static func parseFromMovieBinary(_ data: Data) throws -> SvgaEntity {
         let parsed = try parseMovie(data)
         let (imageBytes, audioBytes) = classifyBlobs(parsed)
-        let images = decodeImages(imageBytes)
+        let images = decodeImages(imageBytes, movie: parsed.movie)
         composeTransforms(parsed.movie, images: images)
         return SvgaEntity(movie: parsed.movie, images: images, audioData: audioBytes)
     }
@@ -145,23 +177,72 @@ internal enum SvgaParser {
         return trimmed
     }
 
-    private static func decodeImages(_ source: [String: Data]) -> [String: CGImage] {
+    private static func decodeImages(_ source: [String: Data], movie: MovieEntity) -> [String: CGImage] {
+        let drawn = drawnSizes(movie)
         var out: [String: CGImage] = [:]
         out.reserveCapacity(source.count)
         for (key, data) in source {
-            guard let image = decodeImage(data) else { continue }
+            guard let image = decodeImage(data, drawnSize: drawn[key]) else { continue }
             out[key] = image
         }
         return out
     }
 
-    private static func decodeImage(_ data: Data) -> CGImage? {
+    /// The largest size each image is drawn at, in screen pixels, across every
+    /// sprite and frame that uses it. Runs on the authored frame transforms,
+    /// before `composeTransforms` folds in the bitmap scale. Images that no
+    /// frame shows are left out (decoded at the device cap, as before).
+    static func drawnSizes(_ movie: MovieEntity) -> [String: CGSize] {
+        let screen = screenPixels
+        guard screen.width > 0, screen.height > 0,
+              movie.viewBoxWidth > 0, movie.viewBoxHeight > 0 else { return [:] }
+        // Fill-scale bounds both aspect-fit and aspect-fill on this screen.
+        let toScreen = max(screen.width / movie.viewBoxWidth, screen.height / movie.viewBoxHeight)
+        var out: [String: CGSize] = [:]
+        for sprite in movie.sprites {
+            var w = out[sprite.imageKey]?.width ?? 0
+            var h = out[sprite.imageKey]?.height ?? 0
+            for frame in sprite.frames where frame.hasContent {
+                let t = frame.transform
+                let sx = (t.a * t.a + t.b * t.b).squareRoot()
+                let sy = (t.c * t.c + t.d * t.d).squareRoot()
+                w = max(w, frame.layout.size.width * sx * toScreen)
+                h = max(h, frame.layout.size.height * sy * toScreen)
+            }
+            if w > 0, h > 0 { out[sprite.imageKey] = CGSize(width: w, height: h) }
+        }
+        return out
+    }
+
+    /// Longest-side pixel cap for an image of `pixels` drawn at `drawn`: the
+    /// drawn size plus headroom, never above the original or the device cap.
+    static func decodeCap(pixels: CGSize, drawn: CGSize?, deviceCap: Int) -> Int {
+        let longest = max(pixels.width, pixels.height)
+        guard let drawn = drawn, longest > 0, pixels.width > 0, pixels.height > 0 else {
+            return deviceCap
+        }
+        let scale = min(1, max(drawn.width / pixels.width, drawn.height / pixels.height) * DISPLAY_HEADROOM)
+        return max(16, min(deviceCap, Int((longest * scale).rounded(.up))))
+    }
+
+    private static func decodeImage(_ data: Data, drawnSize: CGSize?) -> CGImage? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        var cap = maxBitmapDimension
+        if drawnSize != nil,
+           let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+           let pw = props[kCGImagePropertyPixelWidth] as? Int,
+           let ph = props[kCGImagePropertyPixelHeight] as? Int {
+            cap = decodeCap(
+                pixels: CGSize(width: pw, height: ph),
+                drawn: drawnSize,
+                deviceCap: maxBitmapDimension
+            )
+        }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxBitmapDimension,
+            kCGImageSourceThumbnailMaxPixelSize: cap,
         ]
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }

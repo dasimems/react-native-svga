@@ -254,6 +254,12 @@ export const SvgaCache = {
   /** Drops the entire on-disk + in-memory cache. */
   clear: (): void => getManager().clearCache(),
 
+  /**
+   * Drops decoded animations from memory only. The disk cache stays, so the
+   * next play decodes from disk instead of downloading again.
+   */
+  clearMemory: (): void => getManager().clearMemoryCache(),
+
   /** Total size of the on-disk SVGA cache, in bytes. */
   size: (): Promise<number> => getManager().getCacheSize(),
 

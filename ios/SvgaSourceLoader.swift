@@ -106,27 +106,43 @@ internal enum SvgaSourceLoader {
         }
         if !shouldStart { return callbackId }
 
-        loadData(source, cacheKey: key, attachTaskFor: key) { result in
+        loadAndParse(source, key: key, allowDiskCache: true)
+        return callbackId
+    }
+
+    /// Fetch bytes (disk hit or download), parse off the delivery queue, and
+    /// fan the result out to every awaiter registered under `key`.
+    ///
+    /// A disk hit that fails to parse (truncated, bit-rotted, written by an
+    /// older incompatible build) is dropped and the load is retried once
+    /// with the disk cache bypassed, so a corrupt entry self-heals on the
+    /// next play instead of erroring until LRU happens to evict it.
+    private static func loadAndParse(_ source: String, key: String, allowDiskCache: Bool) {
+        loadData(source, cacheKey: key, attachTaskFor: key, allowDiskCache: allowDiskCache) { result in
             switch result {
             case .failure(let err):
                 fanOut(key: key, result: .failure(err))
-            case .success(let data):
+            case .success(let loaded):
                 // Hop off the URLSession callback queue before parsing —
                 // a 64 MB inflate plus N image decodes here would block
                 // every other download whose completion lands on the
                 // same delegate queue.
                 parseQueue.async {
                     do {
-                        let parsed = try SvgaParser.parse(data)
+                        let parsed = try SvgaParser.parse(loaded.data)
                         SvgaMemoryCache.shared.put(key, parsed)
                         fanOut(key: key, result: .success(parsed))
                     } catch {
+                        if loaded.fromDiskCache {
+                            SvgaDiskCache.remove(key)
+                            loadAndParse(source, key: key, allowDiskCache: false)
+                            return
+                        }
                         fanOut(key: key, result: .failure(error))
                     }
                 }
             }
         }
-        return callbackId
     }
 
     /// Cancel a single registered callback. The underlying network task is
@@ -267,7 +283,15 @@ internal enum SvgaSourceLoader {
         task.resume()
     }
 
-    private static func loadData(_ source: String, cacheKey: String, attachTaskFor sourceForCancel: String? = nil, completion: @escaping (Result<Data, Error>) -> Void) {
+    struct LoadedData {
+        let data: Data
+        /// True when `data` was read back from the disk cache rather than
+        /// fetched or read from a local/bundled path. Lets the parser decide
+        /// whether a parse failure is worth a retry with the cache bypassed.
+        let fromDiskCache: Bool
+    }
+
+    private static func loadData(_ source: String, cacheKey: String, attachTaskFor sourceForCancel: String? = nil, allowDiskCache: Bool = true, completion: @escaping (Result<LoadedData, Error>) -> Void) {
         guard let resolved = UrlValidator.resolve(source) else {
             completion(.failure(SvgaError("invalid source")))
             return
@@ -275,7 +299,7 @@ internal enum SvgaSourceLoader {
         if resolved.kind == .localFile {
             do {
                 let data = try Data(contentsOf: URL(fileURLWithPath: resolved.value), options: .mappedIfSafe)
-                completion(.success(data))
+                completion(.success(LoadedData(data: data, fromDiskCache: false)))
             } catch {
                 completion(.failure(error))
             }
@@ -284,20 +308,21 @@ internal enum SvgaSourceLoader {
         if resolved.kind == .bundledAsset {
             do {
                 let data = try readBundleAsset(resolved.value)
-                completion(.success(data))
+                completion(.success(LoadedData(data: data, fromDiskCache: false)))
             } catch {
                 completion(.failure(error))
             }
             return
         }
-        if let cachedURL = SvgaDiskCache.cachedURL(cacheKey) {
-            do {
-                let data = try Data(contentsOf: cachedURL, options: .mappedIfSafe)
-                completion(.success(data))
-            } catch {
-                completion(.failure(error))
+        if allowDiskCache, let cachedURL = SvgaDiskCache.cachedURL(cacheKey) {
+            // Read failure here (file vanished between the existence check
+            // and the read, unreadable inode) is treated like a corrupt
+            // entry: drop it and download rather than fail the play.
+            if let data = try? Data(contentsOf: cachedURL, options: .mappedIfSafe) {
+                completion(.success(LoadedData(data: data, fromDiskCache: true)))
+                return
             }
-            return
+            SvgaDiskCache.remove(cacheKey)
         }
         download(resolved.value, attachTaskFor: sourceForCancel) { result in
             switch result {
@@ -307,7 +332,7 @@ internal enum SvgaSourceLoader {
                 // a blocking write. Save under the explicit cacheKey so
                 // subsequent reads via the same key hit.
                 SvgaDiskCache.saveSvgaAsync(cacheKey, data: data)
-                completion(.success(data))
+                completion(.success(LoadedData(data: data, fromDiskCache: false)))
             }
         }
     }

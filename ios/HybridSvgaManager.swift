@@ -7,6 +7,7 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
     private let sounds = SvgaSoundLibrary()
 
     func preload(urls: [String], cacheKeys: [String]) throws -> Promise<Void> {
+        SvgaParser.captureScreenSize()
         // The manager is owned by Nitro for the JS context's lifetime; if we
         // captured `self` weakly and Nitro reclaimed the manager mid-preload,
         // the promise would resolve with `()` instead of failing — JS-side
@@ -19,6 +20,7 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
     }
 
     func preloadDecoded(urls: [String], cacheKeys: [String]) throws -> Promise<Void> {
+        SvgaParser.captureScreenSize()
         let limit = Self.MAX_CONCURRENT_PRELOADS
         return Promise.async {
             // Collect the first error and propagate it once the group drains
@@ -91,6 +93,10 @@ final class HybridSvgaManager: HybridSvgaManagerSpec {
 
     private static func assetExists(_ name: String) -> Bool {
         return SvgaSourceLoader.bundleURL(for: name) != nil
+    }
+
+    func clearMemoryCache() throws {
+        SvgaMemoryCache.shared.clear()
     }
 
     func clearCache() throws {

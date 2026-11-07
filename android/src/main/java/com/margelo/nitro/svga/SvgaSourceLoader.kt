@@ -83,8 +83,32 @@ internal object SvgaSourceLoader {
   }
 
   private fun loadEntityBlocking(ctx: Context, source: String, cacheKey: String): SvgaEntity {
-    val stream = openStream(ctx, source, cacheKey)
-    return stream.use { SvgaParser.parse(it) }
+    val resolved = UrlValidator.resolve(source) ?: throw SourceException("invalid source")
+    if (resolved.kind == UrlValidator.Kind.LOCAL_FILE) {
+      return File(resolved.value).inputStream().use { SvgaParser.parse(it) }
+    }
+    if (resolved.kind == UrlValidator.Kind.BUNDLED_ASSET) {
+      return ctx.assets.open(resolved.value).use { SvgaParser.parse(it) }
+    }
+    // Disk hit: play from the cached bytes. If the entry is unparseable
+    // (truncated, bit-rotted, written by an older incompatible build) drop
+    // it and fall through to a fresh download instead of surfacing an
+    // error that would repeat on every play until LRU happened to evict it.
+    SvgaDiskCache.cachedFile(ctx, cacheKey)?.let { cached ->
+      try {
+        return cached.inputStream().use { SvgaParser.parse(it) }
+      } catch (e: Exception) {
+        if (Thread.currentThread().isInterrupted) throw e
+        SvgaDiskCache.remove(ctx, cacheKey)
+      }
+    }
+    val bytes = downloadBytes(resolved.value)
+    // Best-effort disk-cache warm; skipped when the device is out of space.
+    // Playback never depends on the write succeeding — we parse from the
+    // in-memory bytes we just downloaded, so a full disk degrades to "no
+    // caching", not "no playback".
+    SvgaDiskCache.saveSvgaQuietly(ctx, cacheKey, bytes)
+    return java.io.ByteArrayInputStream(bytes).use { SvgaParser.parse(it) }
   }
 
   private fun sanitizeForLog(url: String): String {
@@ -127,22 +151,6 @@ internal object SvgaSourceLoader {
     }
     val bytes = downloadBytes(resolved.value)
     return SvgaDiskCache.saveSound(ctx, cacheKey, bytes)
-  }
-
-  private fun openStream(ctx: Context, source: String, cacheKey: String): InputStream {
-    val resolved = UrlValidator.resolve(source) ?: throw SourceException("invalid source")
-    if (resolved.kind == UrlValidator.Kind.LOCAL_FILE) return File(resolved.value).inputStream()
-    if (resolved.kind == UrlValidator.Kind.BUNDLED_ASSET) return ctx.assets.open(resolved.value)
-    val cached = SvgaDiskCache.cachedFile(ctx, cacheKey)
-    if (cached != null) return cached.inputStream()
-    val bytes = downloadBytes(resolved.value)
-    // Best-effort disk-cache warm; skipped when the device is out of space.
-    // Playback never depends on the write succeeding — we parse from the
-    // in-memory bytes we just downloaded, so a full disk degrades to "no
-    // caching", not "no playback" (previously a failed saveSvga threw and
-    // broke the load entirely).
-    SvgaDiskCache.saveSvgaQuietly(ctx, cacheKey, bytes)
-    return java.io.ByteArrayInputStream(bytes)
   }
 
   private fun readAssetBytes(ctx: Context, name: String): ByteArray {

@@ -153,6 +153,16 @@ internal enum SvgaDiskCache {
         return url
     }
 
+    /// Drop a single SVGA entry. Used when a cached file turns out to be
+    /// unparseable so the next load re-downloads instead of failing forever.
+    /// Runs on `writeQueue` so it can't race an in-progress atomic write.
+    static func remove(_ cacheKey: String) {
+        let url = svgaURL(forKey: cacheKey)
+        writeQueue.sync {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
     static func clearSvga() throws {
         let dir = try ensureDir(SVGA_DIR)
         let items = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)

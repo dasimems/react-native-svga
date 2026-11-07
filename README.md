@@ -269,6 +269,16 @@ useEffect(() => {
 
 Preload is **idempotent** — items already on disk under the same `cacheKey` are skipped, no network request issued. Calling `preload(...)` repeatedly with the same input is therefore cheap; only entries missing from disk (or expired via `setMaxAgeMs`) are downloaded. If you bump a `cacheKey`, only that one entry re-downloads.
 
+### Why a cache miss always costs a full download
+
+An SVGA file is a single zlib stream wrapping one protobuf message. Every sprite layer is stored with all of its frames, and the sprite images are inlined in the same message, so frame 0 cannot be drawn until the whole file has arrived and been inflated. There is no progressive or streaming playback for this format, on any platform. On a cache miss the player parses and plays from the downloaded bytes the moment the last byte lands (the disk write happens alongside and is never waited on), but the download itself is unavoidable.
+
+If a first play must be instant, have the bytes present before the play is requested:
+
+- **Warm a catalog** with `preload(...)` at startup or sign-in. Size `setLimit` to fit it; LRU eviction of a warmed entry just means a download on its next play.
+- **Decode ahead of a queue** with `preloadDecoded(...)` for the next few items while the current one plays, so hand-offs skip download, parse and image decode.
+- **Decode at the user action** that will lead to a play (a send button, a selection) so the round-trip to your server is spent downloading.
+
 The full facade:
 
 ```ts
@@ -417,6 +427,7 @@ interface SvgaPlayerHandle {
 - Path traversal (`..`) rejected at the validator and in zip entry names
 - Bundle and entry size caps in the parser
 - Atomic disk writes (tmp + rename) so a partial download can't corrupt the cache
+- A cached entry that fails to parse (bit-rot, truncation, incompatible older build) is deleted and re-downloaded in the same load, so a bad file can't poison a key until LRU evicts it
 
 ## Lifecycle and background playback
 

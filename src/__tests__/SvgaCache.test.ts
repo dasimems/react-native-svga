@@ -6,6 +6,7 @@ type MockSvgaManager = {
   isCached: jest.Mock;
   getCachePath: jest.Mock;
   clearCache: jest.Mock;
+  clearMemoryCache: jest.Mock;
   getCacheSize: jest.Mock;
   getCacheCount: jest.Mock;
   setCacheLimit: jest.Mock;
@@ -25,6 +26,7 @@ const buildMockManager = (): MockSvgaManager => ({
   isCached: jest.fn().mockReturnValue(false),
   getCachePath: jest.fn().mockReturnValue(null),
   clearCache: jest.fn(),
+  clearMemoryCache: jest.fn(),
   getCacheSize: jest.fn().mockResolvedValue(0),
   getCacheCount: jest.fn().mockResolvedValue(0),
   setCacheLimit: jest.fn(),
@@ -94,6 +96,12 @@ describe('SvgaCache', () => {
       SvgaCache.preload([{ url: 'https://a.test/x.svga', cacheKey: 1 }])
     ).toThrow(/cacheKey must be a string/);
     expect(mockManager.preload).not.toHaveBeenCalled();
+  });
+
+  it('clears only the memory cache with clearMemory()', () => {
+    SvgaCache.clearMemory();
+    expect(mockManager.clearMemoryCache).toHaveBeenCalledTimes(1);
+    expect(mockManager.clearCache).not.toHaveBeenCalled();
   });
 
   it('forwards cacheKey override to has() and path()', () => {

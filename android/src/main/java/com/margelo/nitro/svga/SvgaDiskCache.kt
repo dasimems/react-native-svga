@@ -109,6 +109,12 @@ internal object SvgaDiskCache {
     return file
   }
 
+  /// Drop a single SVGA entry. Used when a cached file turns out to be
+  /// unparseable so the next load re-downloads instead of failing forever.
+  fun remove(ctx: Context, cacheKey: String) {
+    synchronized(writeLock) { svgaFile(ctx, cacheKey).delete() }
+  }
+
   fun clearSvga(ctx: Context) { deleteAll(svgaDir(ctx)) }
   fun clearSounds(ctx: Context) { deleteAll(soundDir(ctx)) }
 
